@@ -1,0 +1,6 @@
+streamlit
+ezdxf
+pillow
+numpy
+pandas
+reportlab
