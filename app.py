@@ -61,6 +61,7 @@ DEFAULT_KERF = 0.0
 DEFAULT_ROT_STEP = 15
 DEFAULT_QTY = 1
 PROJECTS_ROOT = "projects"
+DEFAULT_PROJECT_DISPLAY_NAME = " Unnamed file"
 
 try:
     import shutil  # for project deletion
@@ -77,7 +78,7 @@ def _save_project_meta():
         return
     meta = {
         "project_id": pid,
-        "name": st.session_state.get("project_name", pid),
+        "name": _normalized_project_name(st.session_state.get("project_name"), pid),
         "created_at": st.session_state.get("project_created_at"),
         "updated_at": datetime.datetime.now().isoformat(),
     }
@@ -94,6 +95,15 @@ def _load_project_meta(pid: str):
     except Exception:
         return None
 
+def _normalized_project_name(name, pid=None):
+    raw = name if isinstance(name, str) else ("" if name is None else str(name))
+    trimmed = raw.strip()
+    if not trimmed:
+        return DEFAULT_PROJECT_DISPLAY_NAME
+    if pid and trimmed == pid:
+        return DEFAULT_PROJECT_DISPLAY_NAME
+    return raw
+
 def _create_new_project(initial_name: str = None):
     _ensure_projects_root()
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -106,7 +116,7 @@ def _create_new_project(initial_name: str = None):
     st.session_state.project_id = pid
     st.session_state.project_path = path
     st.session_state.project_created_at = datetime.datetime.now().isoformat()
-    st.session_state.project_name = initial_name or "New Project"
+    st.session_state.project_name = _normalized_project_name(initial_name or DEFAULT_PROJECT_DISPLAY_NAME, pid)
     # RESET ALL PROJECT-SPECIFIC STATE
     st.session_state.uploaded_meta = []
     st.session_state.nested_sheets = None
@@ -161,7 +171,7 @@ def _init_project_if_needed():
         st.session_state.project_id = pid
         st.session_state.project_path = os.path.join(PROJECTS_ROOT, pid)
         st.session_state.project_created_at = datetime.datetime.now().isoformat()
-        st.session_state.project_name = pid  # default name = id until renamed
+        st.session_state.project_name = _normalized_project_name(DEFAULT_PROJECT_DISPLAY_NAME, pid)
         try:
             os.makedirs(st.session_state.project_path, exist_ok=True)
         except Exception:
@@ -209,7 +219,8 @@ def _load_project(pid: str):
         # restore
         st.session_state.project_id = payload.get("project_id", pid)
         st.session_state.project_path = root
-        st.session_state.project_name = payload.get("project_name") or ( (_load_project_meta(pid) or {}).get("name") or pid )
+        raw_name = payload.get("project_name") or ((_load_project_meta(pid) or {}).get("name"))
+        st.session_state.project_name = _normalized_project_name(raw_name, st.session_state.project_id)
         st.session_state.project_created_at = payload.get("project_created_at") or ( (_load_project_meta(pid) or {}).get("created_at") )
         if payload.get("config_inputs"):
             st.session_state.config_inputs = payload["config_inputs"]
@@ -2163,7 +2174,8 @@ if "stage" not in st.session_state:
     st.session_state.stage = "SET"
 if "project_name" not in st.session_state and st.session_state.get("project_id"):
     meta = _load_project_meta(st.session_state.project_id)
-    st.session_state.project_name = (meta or {}).get("name", st.session_state.project_id)
+    raw = (meta or {}).get("name")
+    st.session_state.project_name = _normalized_project_name(raw, st.session_state.project_id)
 if "project_created_at" not in st.session_state and st.session_state.get("project_id"):
     meta = _load_project_meta(st.session_state.project_id)
     st.session_state.project_created_at = (meta or {}).get("created_at", datetime.datetime.now().isoformat())
@@ -2198,7 +2210,7 @@ with st.sidebar:
     project_items = []
     for pid in existing:
         meta = _load_project_meta(pid) or {}
-        name = meta.get("name") or pid
+        name = _normalized_project_name(meta.get("name"), pid)
         created = meta.get("created_at") or ""
         try:
             dt_obj = datetime.datetime.fromisoformat(created)
@@ -2207,17 +2219,35 @@ with st.sidebar:
             created_h = created
         project_items.append({"pid": pid, "name": name, "created_h": created_h})
     if project_items:
-        display_names = ["(current)"] + [item["name"] for item in project_items]
-        sel = st.selectbox("Switch Project", display_names, index=0, key="proj_select")
-        prev_sel = st.session_state.get("_prev_proj_sel", "(current)")
+        for item in project_items:
+            label = item["name"]
+            if item["created_h"]:
+                label = f"{label} · {item['created_h']}"
+            item["label"] = label
+
+        project_selector_values = ["__current__"] + [item["pid"] for item in project_items]
+
+        def _project_option_label(value):
+            if value == "__current__":
+                return "(current)"
+            match = next((itm for itm in project_items if itm["pid"] == value), None)
+            return match["label"] if match else DEFAULT_PROJECT_DISPLAY_NAME
+
+        sel = st.selectbox(
+            "Switch Project",
+            project_selector_values,
+            index=0,
+            key="proj_select",
+            format_func=_project_option_label,
+        )
+        prev_sel = st.session_state.get("_prev_proj_sel", "__current__")
         if sel != prev_sel:
             st.session_state._prev_proj_sel = sel
-            if sel != "(current)":
-                idx = display_names.index(sel) - 1
-                chosen_pid = project_items[idx]["pid"]
-                if _load_project(chosen_pid):
-                    st.success(f"Loaded '{sel}'")
-                    st.toast(f"Project '{sel}' loaded", icon="📁")
+            if sel != "__current__":
+                if _load_project(sel):
+                    label = _project_option_label(sel)
+                    st.success(f"Loaded '{label}'")
+                    st.toast(f"Project '{label}' loaded", icon="📁")
                     st.rerun()
         with st.expander("Project Details", expanded=False):
             for item in project_items:
@@ -2232,7 +2262,7 @@ with st.sidebar:
                         if _delete_project(item['pid']):
                             # If current deleted, create replacement
                             if cur:
-                                _create_new_project("New Project")
+                                _create_new_project(DEFAULT_PROJECT_DISPLAY_NAME)
                             st.toast("Project deleted", icon="❌")
                             st.rerun()
                 st.markdown("<hr style='margin:6px 0'>", unsafe_allow_html=True)
@@ -2243,13 +2273,20 @@ with st.sidebar:
 
     def _rename_current():
         new_name = st.session_state.get("proj_name_input")
-        if new_name and new_name.strip() and new_name.strip() != st.session_state.get("project_name"):
-            st.session_state.project_name = new_name.strip()
+        if new_name:
+            trimmed = new_name.strip()
+        else:
+            trimmed = ""
+        if trimmed and trimmed != st.session_state.get("project_name"):
+            st.session_state.project_name = _normalized_project_name(trimmed, st.session_state.get("project_id"))
             _save_project_meta()
             _auto_save_project()
-    st.text_input("Project Name", value=st.session_state.get("project_name", "Unnamed"), key="proj_name_input", on_change=_rename_current)
+    active_project_name = _normalized_project_name(st.session_state.get("project_name"), st.session_state.get("project_id"))
+    if st.session_state.get("project_name") != active_project_name:
+        st.session_state.project_name = active_project_name
+    st.text_input("Project Name", value=active_project_name, key="proj_name_input", on_change=_rename_current)
     # Show only human-friendly project name, not internal ID
-    st.caption(f"Active project: {st.session_state.get('project_name','(none)')}")
+    st.caption(f"Active project: {active_project_name}")
     if st.button("Force Save", key="proj_force_save"):
         _auto_save_project("manual")
         st.success("Project saved")
@@ -2461,14 +2498,13 @@ with col_c:
                 unsafe_allow_html=True,
             )
 
-         
-            h_cols = st.columns([0.5, 6.0, 2.0, 1.4, 1.4, 1.9])
-            h_cols[0].markdown("**#**")
-            h_cols[1].markdown("**Filename / Preview**")
-            h_cols[2].markdown("**Quantity**")
-            h_cols[3].markdown("**Height (mm)**")
-            h_cols[4].markdown("**Width (mm)**")
-            h_cols[5].markdown("**Remove**")
+            col_spec = [6.2, 2.0, 1.4, 1.4, 1.9]
+            h_cols = st.columns(col_spec)
+            h_cols[0].markdown("**Filename / Preview**")
+            h_cols[1].markdown("**Quantity**")
+            h_cols[2].markdown("**Height (mm)**")
+            h_cols[3].markdown("**Width (mm)**")
+            h_cols[4].markdown("**Remove**")
 
             def _change_qty(mid: str, delta: int):
                 for it in st.session_state.uploaded_meta:
@@ -2478,12 +2514,9 @@ with col_c:
 
             removed_id_tbl = None
 
-            for idx, m in enumerate(st.session_state.uploaded_meta, start=1):
-                r_cols = st.columns([0.5, 6.0, 2.0, 1.4, 1.4, 1.9])
+            for m in st.session_state.uploaded_meta:
+                r_cols = st.columns(col_spec)
                 with r_cols[0]:
-                    st.markdown(f"{idx}")
-
-                with r_cols[1]:
                     thumb = create_file_preview_thumbnail(m, width=200, height=120)
                     sub = st.columns([1.8, 4.2])
                     with sub[0]:
@@ -2502,7 +2535,7 @@ with col_c:
                         )
 
                
-                with r_cols[2]:
+                with r_cols[1]:
                     # Revert to native number input (arrows inside box) for instant single-click change
                     new_qty = st.number_input(
                         "Qty",
@@ -2523,13 +2556,13 @@ with col_c:
                     bb = p0.get("orig_bbox") or bbox_from_entities(p0.get("entities", []))
                     b_w = max(0.0, (bb[2] - bb[0]))
                     b_h = max(0.0, (bb[3] - bb[1]))
-                with r_cols[3]:
+                with r_cols[2]:
                     st.markdown(f"{b_h:.1f}")
-                with r_cols[4]:
+                with r_cols[3]:
                     st.markdown(f"{b_w:.1f}")
 
                 # Remove
-                with r_cols[5]:
+                with r_cols[4]:
                     # Shift upward for visual alignment with other row cells
                     st.markdown("<div class='rm-cell' style='position:relative;top:-6px'>", unsafe_allow_html=True)
                     if st.button(
