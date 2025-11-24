@@ -1,0 +1,21 @@
+{
+  "timestamp": "2025-11-24T16:02:19.366396",
+  "project_id": "proj_20251124_160219_cde9e4",
+  "project_name": "New Project",
+  "project_created_at": "2025-11-24T16:02:19.361090",
+  "config_inputs": {
+    "sheet_w": 1000.0,
+    "sheet_h": 1000.0,
+    "spacing": 5.0,
+    "kerf": 0.0,
+    "rotation_mode": "Free Rotation (Optimized)",
+    "rotation_step": 15,
+    "preview_canvas_px": 900,
+    "show_bbox": true,
+    "show_outline": true
+  },
+  "config": {},
+  "uploaded_meta": [],
+  "nested_sheets": null,
+  "part_summary": []
+}
