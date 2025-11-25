@@ -589,14 +589,27 @@ def calculate_relative_offsets_for_part(part):
 
 
 def transform_point(pt, origin, angle_deg, translate_x, translate_y):
+    """Rotate a point around `origin` by angle_deg and then translate.
+
+    This is used for both preview drawing and DXF export.
+    """
     rad = math.radians(angle_deg)
     cos_r = math.cos(rad)
     sin_r = math.sin(rad)
+
+    # Local coordinates around rotation origin
     local_x = pt[0] - origin[0]
     local_y = pt[1] - origin[1]
+
+    # Correct 2D rotation
     x_rot = local_x * cos_r - local_y * sin_r
     y_rot = local_x * sin_r + local_y * cos_r
-    return (x_rot + origin[0] + translate_x, y_rot + origin[1] + translate_y)
+
+    # Translate back and apply final translation offset
+    return (
+        x_rot + origin[0] + translate_x,
+        y_rot + origin[1] + translate_y,
+    )
 
 
 # ---------------------------
@@ -1265,35 +1278,51 @@ def find_best_rotation_for_position(
 def bottom_left_place_with_rotation(
     part, placed_bboxes, sheet_w, sheet_h, spacing, rotations, aggressive=False
 ):
+    """
+    Try to place `part` on the sheet using a bottom‑left heuristic.
+
+    - Candidate X/Y positions come from edges of already placed parts.
+    - When `aggressive` is True we also use left/bottom edges as anchors.
+    - We do NOT cap the number of candidate positions; this lets us exploit
+      narrow leftover strips and corners.
+    """
     potential_xs = {spacing}
     potential_ys = {spacing}
+
     for pb in placed_bboxes:
+        # Right / top edges
         potential_xs.add(pb[2] + spacing)
         potential_ys.add(pb[3] + spacing)
         if aggressive:
+            # Also consider left / bottom edges for extra anchors
             potential_xs.add(pb[0] + spacing)
             potential_ys.add(pb[1] + spacing)
+
     sorted_xs = sorted(potential_xs)
     sorted_ys = sorted(potential_ys)
-    if aggressive:
-        MAX_CAND = 40
-        sorted_xs = sorted_xs[:MAX_CAND]
-        sorted_ys = sorted_ys[:MAX_CAND]
+
     best_placement = None
     best_score = None
+
     for y in sorted_ys:
         for x in sorted_xs:
             rotation, bbox_info = find_best_rotation_for_position(
                 part, x, y, placed_bboxes, sheet_w, sheet_h, spacing, rotations
             )
-            if rotation is not None and bbox_info is not None:
-                candidate, anchor, rot_bbox = bbox_info
-                score = (candidate[3], candidate[2]) if aggressive else calculate_bbox_area(candidate)
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_placement = (rotation, candidate, anchor, rot_bbox)
-    return best_placement
+            if rotation is None or bbox_info is None:
+                continue
 
+            candidate, anchor, rot_bbox = bbox_info
+
+            # Score: lower Y (bottom), then lower X (left), then smaller bbox area.
+            area = calculate_bbox_area(candidate)
+            score = (candidate[3], candidate[0], area)
+
+            if best_score is None or score < best_score:
+                best_score = score
+                best_placement = (rotation, candidate, anchor, rot_bbox)
+
+    return best_placement
 
 def nest_parts_improved(
     parts,
@@ -1308,6 +1337,23 @@ def nest_parts_improved(
     rotation_prune_tolerance=0.05,
     aggressive_packing=True,
 ):
+    """
+    Main nesting routine with:
+    - precomputation of geometry
+    - bottom‑left placement with rotation
+    - compaction
+    - cross‑sheet relocation
+    - global repack (only accepted if *all* parts are kept and sheet count
+      does not increase)
+
+    IMPORTANT: upload order is ignored. Parts are shuffled and then ordered
+    by geometry, not by file sequence.
+    """
+
+    # ---- PREPARE PART GEOMETRY ------------------------------------------------
+    # Randomize initial order so we don't depend on upload order
+    random.shuffle(parts)
+
     for part in parts:
         ents = []
         if part.get("outer"):
@@ -1324,56 +1370,80 @@ def nest_parts_improved(
         part["centroid"] = get_part_centroid(part)
         calculate_relative_offsets_for_part(part)
 
-    # Advanced ordering: area primary, aspect ratio similarity to sheet secondary
+    # ---- ORDERING: LARGE / SHEET‑LIKE FIRST ----------------------------------
     if advanced_sort:
         sheet_ratio = sheet_w / sheet_h if sheet_h else 1.0
+
         def ordering_key(p):
             bb = p["orig_bbox"]
             w = bb[2] - bb[0]
             h = bb[3] - bb[1] if (bb[3] - bb[1]) else 1e-6
             ratio = w / h
             area = calculate_bbox_area(bb)
-            return (-area, abs(ratio - sheet_ratio))  # negative area for descending
+            # Negative area for descending; small random jitter to break ties
+            jitter = random.random() * 0.01
+            return (-area, abs(ratio - sheet_ratio), jitter)
+
         parts.sort(key=ordering_key)
     else:
-        parts.sort(key=lambda p: calculate_bbox_area(p["orig_bbox"]), reverse=True)
+        # Still ignore upload order: shuffle first, then sort by area only
+        parts.sort(
+            key=lambda p: calculate_bbox_area(p["orig_bbox"]),
+            reverse=True,
+        )
 
+    # ---- ROTATION CANDIDATES --------------------------------------------------
     if free_rotation:
-        rotation_angles = list(range(0, 360, max(1, 360 // FREE_ROTATION_SAMPLES)))
+        rotation_angles = list(
+            range(0, 360, max(1, 360 // FREE_ROTATION_SAMPLES))
+        )
     else:
         rotation_angles = rotations
 
-    # Precompute pruned rotation candidates per part (optional)
+    # Optional pruning: keep only angles whose bbox area is close to best
     if rotation_prune_tolerance > 0:
         for p in parts:
             origin = p.get("centroid", p.get("origin", (0, 0)))
-            cand = []
+            candidates = []
             min_area = float("inf")
             for ang in rotation_angles:
-                rot_bbox = bbox_from_entities([transform_entity(e, origin, ang, 0, 0) for e in p["entities"]])
+                rot_bbox = bbox_from_entities(
+                    [transform_entity(e, origin, ang, 0, 0) for e in p["entities"]]
+                )
                 area = calculate_bbox_area(rot_bbox)
-                cand.append((ang, rot_bbox, area))
+                candidates.append((ang, rot_bbox, area))
                 if area < min_area:
                     min_area = area
-            allowed = [ang for ang, rb, area in cand if area <= min_area * (1 + rotation_prune_tolerance)] or rotation_angles
+            allowed = [
+                ang
+                for ang, _rb, area in candidates
+                if area <= min_area * (1 + rotation_prune_tolerance)
+            ] or rotation_angles
             p["rotation_candidates"] = allowed
     else:
         for p in parts:
             p["rotation_candidates"] = rotation_angles
 
-    sheets = []
+    # ---- INITIAL BOTTOM‑LEFT NESTING -----------------------------------------
+    sheets: list[list[dict]] = []
 
     while parts:
         part = parts.pop(0)
         placed = False
 
+        # Try existing sheets first
         for sheet in sheets:
             placed_bboxes = [x["placed_bbox"] for x in sheet]
             rotation_list = part.get("rotation_candidates", rotation_angles)
             placement = bottom_left_place_with_rotation(
-                part, placed_bboxes, sheet_w, sheet_h, spacing, rotation_list, aggressive=aggressive_packing
+                part,
+                placed_bboxes,
+                sheet_w,
+                sheet_h,
+                spacing,
+                rotation_list,
+                aggressive=aggressive_packing,
             )
-
             if placement:
                 rotation, candidate, anchor, rot_bbox = placement
                 inst = part.copy()
@@ -1391,15 +1461,20 @@ def nest_parts_improved(
                 placed = True
                 break
 
+        # If not placed, open a new sheet
         if not placed:
             rotation_list = part.get("rotation_candidates", rotation_angles)
             placement = bottom_left_place_with_rotation(
-                part, [], sheet_w, sheet_h, spacing, rotation_list, aggressive=aggressive_packing
+                part,
+                [],
+                sheet_w,
+                sheet_h,
+                spacing,
+                rotation_list,
+                aggressive=aggressive_packing,
             )
-
             if placement:
                 rotation, candidate, anchor, rot_bbox = placement
-                new_sheet = []
                 inst = part.copy()
                 inst.update(
                     {
@@ -1411,42 +1486,61 @@ def nest_parts_improved(
                         "rotated_min": (rot_bbox[0], rot_bbox[1]),
                     }
                 )
-                new_sheet.append(inst)
-                sheets.append(new_sheet)
-                placed = True
+                sheets.append([inst])
+            else:
+                # Part cannot fit even on an empty sheet with spacing
+                debug(f"Part {part.get('label', '')} does not fit on sheet.")
+                # We keep going; this part simply isn't nestable.
 
-    # Optional compaction pass to slide parts up/left
+    # ---- COMPACTION: SLIDE LEFT/UP -------------------------------------------
     if enable_compaction:
-        def _compact_sheet(sheet):
+
+        def _compact_sheet(sheet: list[dict]):
+            # Coarse snap based on neighbours
             for _ in range(3 if aggressive_packing else 2):
                 for part in sheet:
                     bbox = part["placed_bbox"]
                     w = bbox[2] - bbox[0]
                     h = bbox[3] - bbox[1]
                     others = [p["placed_bbox"] for p in sheet if p is not part]
+
+                    # Left limit
                     left_limit = spacing
                     for ob in others:
-                        if ob[2] <= bbox[0] and not (ob[3] <= bbox[1] or ob[1] >= bbox[3]):
+                        if (
+                            ob[2] <= bbox[0]
+                            and not (ob[3] <= bbox[1] or ob[1] >= bbox[3])
+                        ):
                             left_limit = max(left_limit, ob[2] + spacing)
                     new_x = max(left_limit, spacing)
+
+                    # Top limit (CAD coords)
                     top_limit = spacing
                     for ob in others:
-                        if ob[3] <= bbox[1] and not (ob[2] <= bbox[0] or ob[0] >= bbox[2]):
+                        if (
+                            ob[3] <= bbox[1]
+                            and not (ob[2] <= bbox[0] or ob[0] >= bbox[2])
+                        ):
                             top_limit = max(top_limit, ob[3] + spacing)
                     new_y = max(top_limit, spacing)
+
                     if new_x < bbox[0] or new_y < bbox[1]:
                         part["placed_bbox"] = (new_x, new_y, new_x + w, new_y + h)
                         part["anchor_X"] = new_x
                         part["anchor_Y"] = new_y
+
+            # Fine sliding in small steps
             step = max(1.0, spacing)
             for part in sheet:
                 moved = True
                 while moved:
                     moved = False
                     bx = part["placed_bbox"]
-                    w = bx[2]-bx[0]
-                    h = bx[3]-bx[1]
+                    w = bx[2] - bx[0]
+                    h = bx[3] - bx[1]
                     others = [p["placed_bbox"] for p in sheet if p is not part]
+
+                    # Slide horizontally
                     target_x = bx[0]
                     while target_x - step >= spacing:
                         cand = (target_x - step, bx[1], target_x - step + w, bx[3])
@@ -1454,6 +1548,8 @@ def nest_parts_improved(
                             target_x -= step
                         else:
                             break
+
+                    # Slide vertically
                     target_y = bx[1]
                     while target_y - step >= spacing:
                         cand = (bx[0], target_y - step, bx[2], target_y - step + h)
@@ -1461,13 +1557,24 @@ def nest_parts_improved(
                             target_y -= step
                         else:
                             break
+
                     if target_x < bx[0] or target_y < bx[1]:
-                        part["placed_bbox"] = (target_x, target_y, target_x + w, target_y + h)
+                        part["placed_bbox"] = (
+                            target_x,
+                            target_y,
+                            target_x + w,
+                            target_y + h,
+                        )
                         part["anchor_X"] = target_x
                         part["anchor_Y"] = target_y
                         moved = True
+
         for sh in sheets:
             _compact_sheet(sh)
+    else:
+        _compact_sheet = lambda _sheet: None  # type: ignore
+
+    # ---- STAGE 1: MOVE PARTS FROM LATER SHEETS TO EARLIER --------------------
     if aggressive_packing and len(sheets) > 1:
         for s_idx in range(1, len(sheets)):
             current = sheets[s_idx]
@@ -1475,82 +1582,106 @@ def nest_parts_improved(
             for part in current:
                 relocated = False
                 for earlier in sheets[:s_idx]:
-                    rotation_list = part.get("rotation_candidates", rotations)
+                    rotation_list = part.get("rotation_candidates", rotation_angles)
                     placement = bottom_left_place_with_rotation(
-                        part, [p["placed_bbox"] for p in earlier], sheet_w, sheet_h, spacing, rotation_list, aggressive=True
+                        part,
+                        [p["placed_bbox"] for p in earlier],
+                        sheet_w,
+                        sheet_h,
+                        spacing,
+                        rotation_list,
+                        aggressive=True,
                     )
                     if placement:
                         rotation, candidate, anchor, rot_bbox = placement
                         inst = part.copy()
-                        inst.update({
-                            "placed_bbox": candidate,
-                            "rotation": rotation,
-                            "anchor_X": anchor[0],
-                            "anchor_Y": anchor[1],
-                            "rotation_origin": part.get("centroid", part.get("origin", (0,0))),
-                            "rotated_min": (rot_bbox[0], rot_bbox[1]),
-                        })
+                        inst.update(
+                            {
+                                "placed_bbox": candidate,
+                                "rotation": rotation,
+                                "anchor_X": anchor[0],
+                                "anchor_Y": anchor[1],
+                                "rotation_origin": part.get(
+                                    "centroid", part.get("origin", (0, 0))
+                                ),
+                                "rotated_min": (rot_bbox[0], rot_bbox[1]),
+                            }
+                        )
                         earlier.append(inst)
                         relocated = True
                         break
                 if not relocated:
                     remaining.append(part)
             sheets[s_idx] = remaining
+
+        # Remove empty sheets and compact again
         sheets = [sh for sh in sheets if sh]
         if enable_compaction:
             for sh in sheets:
                 _compact_sheet(sh)
-    # Free-rectangle repack stage (simplified) to further reduce sheet count
+
+    # ---- STAGE 2: GLOBAL MAXIMAL‑RECTANGLES REPACK ---------------------------
     if aggressive_packing and len(sheets) > 1:
+        total_original_parts = sum(len(sh) for sh in sheets)
+        all_parts_flat = [p for sh in sheets for p in sh]
+
         def _repack_with_free_rects(all_parts, sheet_w, sheet_h, spacing):
-            """Improved rectangle based repack using Maximal Rectangles style splitting.
-            Works only with part bounding boxes (faster) and tries to minimize wasted area
-            and short side leftover. This produces fewer fragmented narrow strips than the
-            previous simplistic right+top split.
+            """
+            Rectangle-based repack. If *any* part cannot be placed,
+            we return None so the caller can keep the original layout.
             """
             def part_bbox_at_rotation(part, ang):
                 origin = part.get("centroid", part.get("origin", (0, 0)))
-                rot_bbox = bbox_from_entities([
-                    transform_entity(e, origin, ang, 0, 0) for e in part.get("entities", [])
-                ])
+                rot_bbox = bbox_from_entities(
+                    [
+                        transform_entity(e, origin, ang, 0, 0)
+                        for e in part.get("entities", [])
+                    ]
+                )
                 w = rot_bbox[2] - rot_bbox[0]
                 h = rot_bbox[3] - rot_bbox[1]
                 return rot_bbox, w, h
 
-            # Copy & sort parts by descending bbox area
             parts_local = [p.copy() for p in all_parts]
             for p in parts_local:
-                bb = p.get("orig_bbox") or bbox_from_entities(p.get("entities", []))
+                bb = p.get("orig_bbox") or bbox_from_entities(
+                    p.get("entities", [])
+                )
                 p["_area"] = calculate_bbox_area(bb)
             parts_local.sort(key=lambda x: x.get("_area", 0), reverse=True)
-
-            new_sheets = []  # each sheet: {parts: [...], free_rects: [(x,y,w,h), ...]}
 
             def _init_sheet():
                 return {
                     "parts": [],
-                    "free_rects": [(spacing, spacing, sheet_w - 2 * spacing, sheet_h - 2 * spacing)],
+                    "free_rects": [
+                        (
+                            spacing,
+                            spacing,
+                            sheet_w - 2 * spacing,
+                            sheet_h - 2 * spacing,
+                        )
+                    ],
                 }
 
             def _split_free_rect(free_rects, index, anchor_x, anchor_y, used_w, used_h):
-                # Split around placed rectangle positioned at (anchor_x, anchor_y) within free rect.
                 fr_x, fr_y, fr_w, fr_h = free_rects[index]
                 del free_rects[index]
-                # Normalize relative coordinates
+
                 rel_x = anchor_x - fr_x
                 rel_y = anchor_y - fr_y
-                # Compute boundaries after placement including spacing guard
+
                 placed_right = rel_x + used_w
                 placed_bottom = rel_y + used_h
-                # Left slice (full height)
+
+                # Left slice
                 if rel_x - spacing > 0:
                     left_rect = (fr_x, fr_y, rel_x - spacing, fr_h)
-                    if left_rect[2] > left_rect[0]:
-                        lw = left_rect[2] - left_rect[0]
-                        lh = left_rect[3] - left_rect[1]
-                        if lw > 2 * spacing and lh > 2 * spacing:
-                            free_rects.append(left_rect)
-                # Right slice (full height)
+                    lw = left_rect[2] - left_rect[0]
+                    lh = left_rect[3] - left_rect[1]
+                    if lw > 2 * spacing and lh > 2 * spacing:
+                        free_rects.append(left_rect)
+
+                # Right slice
                 if fr_w - placed_right - spacing > 0:
                     right_rect = (
                         fr_x + placed_right + spacing,
@@ -1558,25 +1689,20 @@ def nest_parts_improved(
                         fr_w - placed_right - spacing,
                         fr_h,
                     )
-                    if right_rect[2] > right_rect[0]:
-                        rw = right_rect[2] - right_rect[0]
-                        rh = right_rect[3] - right_rect[1]
-                        if rw > 2 * spacing and rh > 2 * spacing:
-                            free_rects.append(right_rect)
-                # Top slice (above part, part width span only)
+                    rw = right_rect[2] - right_rect[0]
+                    rh = right_rect[3] - right_rect[1]
+                    if rw > 2 * spacing and rh > 2 * spacing:
+                        free_rects.append(right_rect)
+
+                # Top slice
                 if rel_y - spacing > 0:
-                    top_rect = (
-                        anchor_x,
-                        fr_y,
-                        used_w,
-                        rel_y - spacing,
-                    )
-                    if top_rect[2] > top_rect[0]:
-                        tw = top_rect[2] - top_rect[0]
-                        th = top_rect[3] - top_rect[1]
-                        if tw > 2 * spacing and th > 2 * spacing:
-                            free_rects.append(top_rect)
-                # Bottom slice (below part, part width span only)
+                    top_rect = (anchor_x, fr_y, used_w, rel_y - spacing)
+                    tw = top_rect[2] - top_rect[0]
+                    th = top_rect[3] - top_rect[1]
+                    if tw > 2 * spacing and th > 2 * spacing:
+                        free_rects.append(top_rect)
+
+                # Bottom slice
                 if fr_h - placed_bottom - spacing > 0:
                     bottom_rect = (
                         anchor_x,
@@ -1584,11 +1710,10 @@ def nest_parts_improved(
                         used_w,
                         fr_h - placed_bottom - spacing,
                     )
-                    if bottom_rect[2] > bottom_rect[0]:
-                        bw = bottom_rect[2] - bottom_rect[0]
-                        bh = bottom_rect[3] - bottom_rect[1]
-                        if bw > 2 * spacing and bh > 2 * spacing:
-                            free_rects.append(bottom_rect)
+                    bw = bottom_rect[2] - bottom_rect[0]
+                    bh = bottom_rect[3] - bottom_rect[1]
+                    if bw > 2 * spacing and bh > 2 * spacing:
+                        free_rects.append(bottom_rect)
 
             def _prune_and_merge(free_rects):
                 # Remove contained rectangles
@@ -1600,12 +1725,18 @@ def nest_parts_improved(
                         if i == j:
                             continue
                         rx2, ry2, rw2, rh2 = r2
-                        if rx >= rx2 and ry >= ry2 and rx + rw <= rx2 + rw2 and ry + rh <= ry2 + rh2:
+                        if (
+                            rx >= rx2
+                            and ry >= ry2
+                            and rx + rw <= rx2 + rw2
+                            and ry + rh <= ry2 + rh2
+                        ):
                             contained = True
                             break
                     if not contained:
                         pruned.append(r)
-                # Simple merge pass: merge horizontally / vertically adjacent same dimension rectangles
+
+                # Merge touching rectangles
                 merged = True
                 while merged:
                     merged = False
@@ -1637,9 +1768,14 @@ def nest_parts_improved(
                     pruned = out
                 return pruned
 
+            new_sheets = []
+            unplaced = []
+
             for part in parts_local:
                 rot_list = part.get("rotation_candidates", rotations)
-                best = None  # (sheet_index, fr_index, ang, w, h, waste, short_fit, rot_bbox)
+                best = None
+
+                # Try to place into existing sheets
                 for si, sheet in enumerate(new_sheets):
                     for fri, fr in enumerate(sheet["free_rects"]):
                         fr_x, fr_y, fr_w, fr_h = fr
@@ -1650,36 +1786,62 @@ def nest_parts_improved(
                                 short_fit = min(fr_w - pw, fr_h - ph)
                                 long_fit = max(fr_w - pw, fr_h - ph)
                                 key = (waste, short_fit, long_fit)
-                                if (best is None) or (key < (best[5], best[6], best[7])):
-                                    best = (si, fri, ang, pw, ph, waste, short_fit, long_fit, rot_bbox)
+                                if (best is None) or (
+                                    key < (best[5], best[6], best[7])
+                                ):
+                                    best = (
+                                        si,
+                                        fri,
+                                        ang,
+                                        pw,
+                                        ph,
+                                        waste,
+                                        short_fit,
+                                        long_fit,
+                                        rot_bbox,
+                                    )
+
                 if best is None:
                     # Open new sheet
                     sheet = _init_sheet()
                     new_sheets.append(sheet)
-                    # choose first rotation that fits the blank sheet
                     chosen_ang = None
                     chosen_bbox = None
                     for ang in rot_list:
                         rot_bbox, pw, ph = part_bbox_at_rotation(part, ang)
-                        if pw + spacing <= sheet_w - 2 * spacing and ph + spacing <= sheet_h - 2 * spacing:
+                        if (
+                            pw + spacing <= sheet_w - 2 * spacing
+                            and ph + spacing <= sheet_h - 2 * spacing
+                        ):
                             chosen_ang = ang
                             chosen_bbox = (rot_bbox, pw, ph)
                             break
                     if chosen_ang is None:
-                        continue  # skip impossible part
+                        unplaced.append(part)
+                        continue  # cannot fit this part at all
+
                     rot_bbox, pw, ph = chosen_bbox
                     anchor_x = spacing
                     anchor_y = spacing
-                    placed_bbox = (anchor_x, anchor_y, anchor_x + pw, anchor_y + ph)
+                    placed_bbox = (
+                        anchor_x,
+                        anchor_y,
+                        anchor_x + pw,
+                        anchor_y + ph,
+                    )
                     inst = part.copy()
-                    inst.update({
-                        "placed_bbox": placed_bbox,
-                        "rotation": chosen_ang,
-                        "anchor_X": anchor_x,
-                        "anchor_Y": anchor_y,
-                        "rotation_origin": part.get("centroid", part.get("origin", (0, 0))),
-                        "rotated_min": (rot_bbox[0], rot_bbox[1]),
-                    })
+                    inst.update(
+                        {
+                            "placed_bbox": placed_bbox,
+                            "rotation": chosen_ang,
+                            "anchor_X": anchor_x,
+                            "anchor_Y": anchor_y,
+                            "rotation_origin": part.get(
+                                "centroid", part.get("origin", (0, 0))
+                            ),
+                            "rotated_min": (rot_bbox[0], rot_bbox[1]),
+                        }
+                    )
                     sheet["parts"].append(inst)
                     _split_free_rect(sheet["free_rects"], 0, anchor_x, anchor_y, pw, ph)
                     sheet["free_rects"] = _prune_and_merge(sheet["free_rects"])
@@ -1687,47 +1849,76 @@ def nest_parts_improved(
                     si, fri, ang, pw, ph, waste, short_fit, long_fit, rot_bbox = best
                     sheet = new_sheets[si]
                     fr_x, fr_y, fr_w, fr_h = sheet["free_rects"][fri]
-                    # Evaluate multiple corner anchor candidates inside free rect to reduce fragmentation
+
                     corner_candidates = []
                     possible_corners = [
-                        (fr_x, fr_y),  # top-left
-                        (fr_x + max(0, fr_w - pw - spacing), fr_y),  # top-right
-                        (fr_x, fr_y + max(0, fr_h - ph - spacing)),  # bottom-left
+                        (fr_x, fr_y),
+                        (fr_x + max(0, fr_w - pw - spacing), fr_y),
+                        (fr_x, fr_y + max(0, fr_h - ph - spacing)),
                     ]
                     for ax, ay in possible_corners:
-                        if ax + pw + spacing <= fr_x + fr_w and ay + ph + spacing <= fr_y + fr_h:
-                            # fragmentation score: number of resulting free rects area variance
+                        if (
+                            ax + pw + spacing <= fr_x + fr_w
+                            and ay + ph + spacing <= fr_y + fr_h
+                        ):
                             frag_score = abs((fr_w * fr_h) - (pw * ph))
                             corner_candidates.append((frag_score, ax, ay))
+
                     if corner_candidates:
                         corner_candidates.sort(key=lambda x: x[0])
                         _, anchor_x, anchor_y = corner_candidates[0]
                     else:
                         anchor_x = fr_x
                         anchor_y = fr_y
-                    placed_bbox = (anchor_x, anchor_y, anchor_x + pw, anchor_y + ph)
+
+                    placed_bbox = (
+                        anchor_x,
+                        anchor_y,
+                        anchor_x + pw,
+                        anchor_y + ph,
+                    )
                     inst = part.copy()
-                    inst.update({
-                        "placed_bbox": placed_bbox,
-                        "rotation": ang,
-                        "anchor_X": anchor_x,
-                        "anchor_Y": anchor_y,
-                        "rotation_origin": part.get("centroid", part.get("origin", (0, 0))),
-                        "rotated_min": (rot_bbox[0], rot_bbox[1]),
-                    })
+                    inst.update(
+                        {
+                            "placed_bbox": placed_bbox,
+                            "rotation": ang,
+                            "anchor_X": anchor_x,
+                            "anchor_Y": anchor_y,
+                            "rotation_origin": part.get(
+                                "centroid", part.get("origin", (0, 0))
+                            ),
+                            "rotated_min": (rot_bbox[0], rot_bbox[1]),
+                        }
+                    )
                     sheet["parts"].append(inst)
-                    _split_free_rect(sheet["free_rects"], fri, anchor_x, anchor_y, pw, ph)
+                    _split_free_rect(
+                        sheet["free_rects"], fri, anchor_x, anchor_y, pw, ph
+                    )
                     sheet["free_rects"] = _prune_and_merge(sheet["free_rects"])
 
+            if unplaced:
+                # Repack failed to place some parts – signal failure
+                debug(f"Repack could not place {len(unplaced)} parts; keeping original layout.")
+                return None
+
             return [s["parts"] for s in new_sheets if s["parts"]]
-        flat_all = [p for sh in sheets for p in sh]
-        repacked = _repack_with_free_rects(flat_all, sheet_w, sheet_h, spacing)
-        if len(repacked) <= len(sheets):
-            # Optional compaction after repack
-            if enable_compaction:
-                for sh in repacked:
-                    _compact_sheet(sh)
-            sheets = repacked
+
+        repacked_sheets = _repack_with_free_rects(
+            all_parts_flat, sheet_w, sheet_h, spacing
+        )
+
+        if repacked_sheets is not None:
+            total_repacked = sum(len(sh) for sh in repacked_sheets)
+            if (
+                len(repacked_sheets) <= len(sheets)
+                and total_repacked == total_original_parts
+            ):
+                # Accept improved layout
+                sheets = repacked_sheets
+                if enable_compaction:
+                    for sh in sheets:
+                        _compact_sheet(sh)
+
     return sheets
 
 
@@ -2210,13 +2401,16 @@ with st.sidebar:
     project_items = []
     for pid in existing:
         meta = _load_project_meta(pid) or {}
+        created_raw = meta.get("created_at")
+        if not created_raw:
+            continue
         name = _normalized_project_name(meta.get("name"), pid)
-        created = meta.get("created_at") or ""
         try:
-            dt_obj = datetime.datetime.fromisoformat(created)
+            dt_obj = datetime.datetime.fromisoformat(created_raw)
             created_h = dt_obj.strftime("%b %d, %Y — %H:%M")
         except Exception:
-            created_h = created
+            # Skip entries we cannot confidently parse for date/time
+            continue
         project_items.append({"pid": pid, "name": name, "created_h": created_h})
     if project_items:
         for item in project_items:
