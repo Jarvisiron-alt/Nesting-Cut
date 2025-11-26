@@ -16,12 +16,14 @@ import uuid
 import random
 import json
 import datetime
+import re
 from collections import defaultdict
 import numpy as np
 import ezdxf
 from PIL import Image, ImageDraw
 import streamlit as st  # type: ignore
 import base64
+import html
 try:
     import pandas as pd  # for Excel export
 except ImportError:
@@ -103,6 +105,22 @@ def _normalized_project_name(name, pid=None):
     if pid and trimmed == pid:
         return DEFAULT_PROJECT_DISPLAY_NAME
     return raw
+
+
+def _project_file_stub(name, pid=None):
+    normalized = _normalized_project_name(name, pid) or DEFAULT_PROJECT_DISPLAY_NAME
+    ascii_only = normalized.encode("ascii", errors="ignore").decode("ascii") or normalized
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", ascii_only).strip("_")
+    if not cleaned:
+        cleaned = "nested_project"
+    return cleaned[:80]
+
+
+def _current_project_file_stub():
+    return _project_file_stub(
+        st.session_state.get("project_name"),
+        st.session_state.get("project_id"),
+    )
 
 def _create_new_project(initial_name: str = None):
     _ensure_projects_root()
@@ -321,6 +339,273 @@ def get_part_centroid(part):
 def calculate_bbox_area(bbox):
     """Calculate area of a bounding box"""
     return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+
+
+def polygon_area(points):
+    """Shoelace area for a polygon defined by points."""
+    if not points or len(points) < 3:
+        return 0.0
+    area = 0.0
+    for i in range(len(points)):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % len(points)]
+        area += x1 * y2 - x2 * y1
+    return abs(area) / 2.0
+
+
+def _bulge_arc_points(p1, p2, bulge, max_seg_deg=10):
+    """Approximate an arc segment defined by bulge with intermediate points."""
+    if abs(bulge) < 1e-6:
+        return [p1, p2]
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    chord = math.hypot(dx, dy)
+    if chord < 1e-9:
+        return [p1, p2]
+    theta = 4.0 * math.atan(bulge)
+    if abs(theta) < 1e-6:
+        return [p1, p2]
+    sin_half = math.sin(theta / 2.0)
+    if abs(sin_half) < 1e-6:
+        return [p1, p2]
+    radius = chord / (2.0 * sin_half)
+    half_chord = chord / 2.0
+    h_sq = max(radius * radius - half_chord * half_chord, 0.0)
+    h = math.sqrt(h_sq)
+    mid_x = (p1[0] + p2[0]) / 2.0
+    mid_y = (p1[1] + p2[1]) / 2.0
+    perp_x = -dy / chord
+    perp_y = dx / chord
+    sign = 1.0 if bulge >= 0 else -1.0
+    cx = mid_x + perp_x * h * sign
+    cy = mid_y + perp_y * h * sign
+    start_ang = math.atan2(p1[1] - cy, p1[0] - cx)
+    end_ang = math.atan2(p2[1] - cy, p2[0] - cx)
+    if sign > 0 and end_ang <= start_ang:
+        end_ang += 2.0 * math.pi
+    elif sign < 0 and end_ang >= start_ang:
+        end_ang -= 2.0 * math.pi
+    segments = max(4, int(abs(theta) / math.radians(max_seg_deg)))
+    pts = []
+    for i in range(segments + 1):
+        t = i / segments
+        ang = start_ang + (end_ang - start_ang) * t
+        pts.append((cx + radius * math.cos(ang), cy + radius * math.sin(ang)))
+    return pts
+
+
+def _expand_polyline_points(points, bulges=None, closed=False):
+    if not points:
+        return []
+    if not bulges:
+        bulges = [0.0] * len(points)
+    result = []
+    count = len(points)
+    for idx, p1 in enumerate(points):
+        if idx == 0:
+            result.append(p1)
+        next_idx = idx + 1
+        if next_idx >= count:
+            if not closed:
+                break
+            p2 = points[0]
+        else:
+            p2 = points[next_idx]
+        bulge = bulges[idx] if idx < len(bulges) else 0.0
+        arc_pts = _bulge_arc_points(p1, p2, bulge)
+        # Skip first point to avoid duplicates; already appended
+        result.extend(arc_pts[1:])
+    if closed and (len(result) < 2 or result[0] != result[-1]):
+        result.append(result[0])
+    return result
+
+
+def _polygon_points_from_entity(entity, auto_close=True):
+    if not entity:
+        return []
+    etype = entity.get("type")
+    if etype == "LWPOLYLINE":
+        pts = entity.get("points", [])
+        bulges = entity.get("bulges", [])
+        closed = entity.get("closed", False) or (pts and pts[0] == pts[-1])
+        return _expand_polyline_points(pts, bulges, closed=auto_close or closed)
+    if etype == "SPLINE":
+        pts = list(entity.get("points", []))
+        if auto_close and pts and pts[0] != pts[-1]:
+            pts.append(pts[0])
+        return pts
+    return []
+
+
+def _entity_area_mm2(entity):
+    """Approximate area (mm^2) represented by a supported entity."""
+    if not entity:
+        return 0.0
+    etype = entity.get("type")
+    if etype == "LWPOLYLINE":
+        pts = _polygon_points_from_entity(entity, auto_close=True)
+        return polygon_area(pts)
+    if etype == "SPLINE":
+        pts = _polygon_points_from_entity(entity, auto_close=True)
+        return polygon_area(pts)
+    if etype == "CIRCLE":
+        radius = float(entity.get("radius", 0.0))
+        return math.pi * radius * radius
+    return 0.0
+
+
+def _entity_reference_point(entity):
+    etype = entity.get("type")
+    if etype == "CIRCLE":
+        return entity.get("center")
+    pts = _polygon_points_from_entity(entity, auto_close=False)
+    if pts:
+        return polygon_centroid(pts)
+    if entity.get("start") and entity.get("end"):
+        sx, sy = entity["start"]
+        ex, ey = entity["end"]
+        return ((sx + ex) / 2.0, (sy + ey) / 2.0)
+    return None
+
+
+def _entity_inside_polygon(entity, polygon_pts):
+    if not polygon_pts:
+        return False
+    ref = _entity_reference_point(entity)
+    if not ref:
+        return False
+    return point_in_polygon(ref, polygon_pts)
+
+
+def _segments_intersect(p1, p2, p3, p4):
+    def orient(a, b, c):
+        val = (b[1] - a[1]) * (c[0] - b[0]) - (b[0] - a[0]) * (c[1] - b[1])
+        if abs(val) < 1e-9:
+            return 0
+        return 1 if val > 0 else 2
+
+    def on_segment(a, b, c):
+        return (
+            min(a[0], c[0]) - 1e-9 <= b[0] <= max(a[0], c[0]) + 1e-9
+            and min(a[1], c[1]) - 1e-9 <= b[1] <= max(a[1], c[1]) + 1e-9
+        )
+
+    o1 = orient(p1, p2, p3)
+    o2 = orient(p1, p2, p4)
+    o3 = orient(p3, p4, p1)
+    o4 = orient(p3, p4, p2)
+
+    if o1 != o2 and o3 != o4:
+        return True
+    if o1 == 0 and on_segment(p1, p3, p2):
+        return True
+    if o2 == 0 and on_segment(p1, p4, p2):
+        return True
+    if o3 == 0 and on_segment(p3, p1, p4):
+        return True
+    if o4 == 0 and on_segment(p3, p2, p4):
+        return True
+    return False
+
+
+def polygons_intersect(poly_a, poly_b):
+    if not poly_a or not poly_b:
+        return False
+
+    def _close(poly):
+        if len(poly) < 2:
+            return poly
+        return poly + [poly[0]] if poly[0] != poly[-1] else poly
+
+    pa = _close(poly_a)
+    pb = _close(poly_b)
+
+    for i in range(len(pa) - 1):
+        for j in range(len(pb) - 1):
+            if _segments_intersect(pa[i], pa[i + 1], pb[j], pb[j + 1]):
+                return True
+
+    if point_in_polygon(pa[0], pb):
+        return True
+    if point_in_polygon(pb[0], pa):
+        return True
+    return False
+
+
+def build_outline_polygon(part, rotation, anchor_x, anchor_y, rot_bbox=None):
+    outer = part.get("outer")
+    if not outer:
+        return None
+    origin = part.get("centroid", part.get("origin", (0, 0)))
+    if rot_bbox is not None:
+        rot_min = (rot_bbox[0], rot_bbox[1])
+    else:
+        rot_min = part.get("rotated_min", (0, 0))
+    if rot_min is None:
+        rot_min = (0, 0)
+    tx = anchor_x - rot_min[0]
+    ty = anchor_y - rot_min[1]
+    transformed = transform_entity(outer, origin, rotation, tx, ty)
+    if not transformed or transformed.get("type") != "LWPOLYLINE":
+        return None
+    pts = list(transformed.get("points", []))
+    if len(pts) < 3:
+        return None
+    if pts[0] != pts[-1]:
+        pts.append(pts[0])
+    return pts
+
+
+def part_surface_area_mm2(part):
+    """Estimate part surface (outer minus internal cutouts)."""
+    if not isinstance(part, dict):
+        return 0.0
+    total = 0.0
+    outer = part.get("outer")
+    outer_pts = []
+    if outer:
+        total += _entity_area_mm2(outer)
+        outer_pts = _polygon_points_from_entity(outer, auto_close=True)
+    else:
+        bbox = part.get("orig_bbox") or bbox_from_entities(part.get("entities", []))
+        total += calculate_bbox_area(bbox)
+
+    def _subtract(group_name, require_inside=False):
+        nonlocal total
+        for ent in part.get(group_name, []) or []:
+            if require_inside and outer_pts:
+                if not _entity_inside_polygon(ent, outer_pts):
+                    continue
+            total -= _entity_area_mm2(ent)
+
+    for group in ("holes", "circles", "splines", "arcs"):
+        _subtract(group)
+    _subtract("others", require_inside=True)
+
+    total = max(total, 0.0)
+    if total == 0.0:
+        bbox = part.get("orig_bbox") or bbox_from_entities(part.get("entities", []))
+        total = max(total, calculate_bbox_area(bbox))
+    return total
+
+
+def _path_length(points):
+    if not points or len(points) < 2:
+        return 0.0
+    total = 0.0
+    for idx in range(1, len(points)):
+        p1 = points[idx - 1]
+        p2 = points[idx]
+        total += math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+    return total
+
+
+def part_perimeter_mm(part):
+    outline = _polygon_points_from_entity(part.get("outer"), auto_close=True)
+    if len(outline) >= 2:
+        return _path_length(outline)
+    bbox = part.get("orig_bbox") or bbox_from_entities(part.get("entities", []))
+    return 2.0 * ((bbox[2] - bbox[0]) + (bbox[3] - bbox[1]))
 
 
 def transform_entity_representation(ent):
@@ -679,6 +964,45 @@ def build_pdf_report(
 
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="SmallGray", fontSize=9, textColor=colors.grey))
+    if "TableCell" not in styles:
+        styles.add(
+            ParagraphStyle(
+                name="TableCell",
+                parent=styles["BodyText"],
+                fontSize=8,
+                leading=11,
+                spaceAfter=0,
+                spaceBefore=0,
+            )
+        )
+    if "TableHeaderSmall" not in styles:
+        styles.add(
+            ParagraphStyle(
+                name="TableHeaderSmall",
+                parent=styles["TableCell"],
+                fontSize=8,
+                leading=11,
+                textColor=colors.HexColor("#0A0F1A"),
+            )
+        )
+
+    def _para_cell(text, header=False):
+        style_name = "TableHeaderSmall" if header else "TableCell"
+        safe_text = html.escape(str(text)).replace("\n", "<br />")
+        return Paragraph(safe_text, styles[style_name])
+
+    def _wrap_table_rows(rows):
+        wrapped = []
+        for ridx, row in enumerate(rows):
+            wrapped_row = []
+            for cell in row:
+                if isinstance(cell, (Paragraph, RLImage, Table, Spacer, KeepTogether)):
+                    wrapped_row.append(cell)
+                else:
+                    wrapped_row.append(_para_cell(cell, header=(ridx == 0)))
+            wrapped.append(wrapped_row)
+        return wrapped
+
     story = []
 
     # Prepare logo / cover image
@@ -783,7 +1107,7 @@ def build_pdf_report(
     sheet_utils = []
     sheet_area = cfg["sheet_w"] * cfg["sheet_h"] if cfg.get("sheet_w") and cfg.get("sheet_h") else 0
     for sh in sheets:
-        part_area_sum = sum(calculate_bbox_area(p.get("placed_bbox", (0,0,0,0))) for p in sh)
+        part_area_sum = sum(part_surface_area_mm2(p) for p in sh)
         util = (part_area_sum / sheet_area * 100.0) if sheet_area > 0 else 0.0
         sheet_utils.append(util)
     overall_avg_util = sum(sheet_utils) / len(sheet_utils) if sheet_utils else 0.0
@@ -837,12 +1161,13 @@ def build_pdf_report(
                 part_counts[lbl] = part_counts.get(lbl, 0) + 1
         if part_counts:
             pc_rows = [["Part", "Qty"]] + [[k, str(v)] for k, v in sorted(part_counts.items(), key=lambda x: x[0].lower())]
-            pc_tbl = Table(pc_rows, repeatRows=1, colWidths=[doc.width*0.6, doc.width*0.4])
+            pc_tbl = Table(_wrap_table_rows(pc_rows), repeatRows=1, colWidths=[doc.width*0.6, doc.width*0.4])
             pc_tbl.setStyle(TableStyle([
                 ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor('#d0d7e2')),
                 ("BACKGROUND", (0,0), (-1,0), colors.HexColor('#e2e8f0')),
                 ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
                 ("FONTSIZE", (0,0), (-1,-1), 8),
+                ("WORDWRAP", (0,0), (-1,-1), "CJK"),
             ]))
             story.append(Paragraph("<b>Part Summary</b>", styles["SectionHeader"]))
             story.append(pc_tbl)
@@ -870,12 +1195,17 @@ def build_pdf_report(
                 f"{b_w:.1f}",
             ])
         if len(file_rows) > 1:
-            files_tbl = Table(file_rows, repeatRows=1, colWidths=[8*mm, 38*mm, 56*mm, 12*mm, 18*mm, 18*mm])
+            files_tbl = Table(
+                _wrap_table_rows(file_rows),
+                repeatRows=1,
+                colWidths=[8*mm, 38*mm, 56*mm, 12*mm, 18*mm, 18*mm],
+            )
             files_tbl.setStyle(TableStyle([
                 ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor('#d0d7e2')),
                 ("BACKGROUND", (0,0), (-1,0), colors.HexColor('#e2e8f0')),
                 ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
                 ("FONTSIZE", (0,0), (-1,-1), 7),
+                ("WORDWRAP", (0,0), (-1,-1), "CJK"),
             ]))
             story.append(Paragraph("<b>Uploaded Files</b>", styles["SectionHeader"]))
             story.append(files_tbl)
@@ -920,7 +1250,7 @@ def build_pdf_report(
     sheet_utils = []
     sheet_area = cfg["sheet_w"] * cfg["sheet_h"] if cfg.get("sheet_w") and cfg.get("sheet_h") else 0
     for sh in sheets:
-        part_area_sum = sum(calculate_bbox_area(p.get("placed_bbox", (0,0,0,0))) for p in sh)
+        part_area_sum = sum(part_surface_area_mm2(p) for p in sh)
         util = (part_area_sum / sheet_area * 100.0) if sheet_area > 0 else 0.0
         sheet_utils.append(util)
     overall_avg_util = sum(sheet_utils) / len(sheet_utils) if sheet_utils else 0.0
@@ -954,12 +1284,13 @@ def build_pdf_report(
                 part_counts[lbl] = part_counts.get(lbl, 0) + 1
         if part_counts:
             pc_rows = [["Part", "Quantity"]] + [[k, str(v)] for k, v in sorted(part_counts.items(), key=lambda x: x[0].lower())]
-            pc_tbl = Table(pc_rows, repeatRows=1, colWidths=[doc.width/2.0, doc.width/2.0])
+            pc_tbl = Table(_wrap_table_rows(pc_rows), repeatRows=1, colWidths=[doc.width/2.0, doc.width/2.0])
             pc_tbl.setStyle(TableStyle([
                 ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
                 ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
                 ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
                 ("FONTSIZE", (0,0), (-1,-1), 8),
+                ("WORDWRAP", (0,0), (-1,-1), "CJK"),
             ]))
             story.append(Paragraph("<b>Part Summary</b>", styles["Normal"]))
             story.append(pc_tbl)
@@ -991,12 +1322,17 @@ def build_pdf_report(
             ])
         if len(file_rows) > 1:
             story.append(Paragraph("<b>Uploaded Files</b>", styles["Normal"]))
-            files_tbl = Table(file_rows, repeatRows=1, colWidths=[8*mm, 35*mm, 50*mm, 12*mm, 20*mm, 20*mm, doc.width - (8+35+50+12+20+20)*mm])
+            files_tbl = Table(
+                _wrap_table_rows(file_rows),
+                repeatRows=1,
+                colWidths=[8*mm, 35*mm, 50*mm, 12*mm, 20*mm, 20*mm, doc.width - (8+35+50+12+20+20)*mm],
+            )
             files_tbl.setStyle(TableStyle([
                 ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
                 ("FONTSIZE", (0,0), (-1,-1), 8),
                 ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
                 ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+                ("WORDWRAP", (0,0), (-1,-1), "CJK"),
             ]))
             story.append(files_tbl)
             story.append(Spacer(1, 6))
@@ -1037,7 +1373,7 @@ def build_pdf_report(
     for s_idx, sh in enumerate(target_sheets, start=(1 if scope == "All sheets" else sel_idx)):
         # Compute utilization
         sheet_area = cfg["sheet_w"] * cfg["sheet_h"]
-        part_area_sum = sum(calculate_bbox_area(p.get("placed_bbox", (0,0,0,0))) for p in sh)
+        part_area_sum = sum(part_surface_area_mm2(p) for p in sh)
         utilization = (part_area_sum / sheet_area * 100.0) if sheet_area > 0 else 0.0
 
         # Small sheet header table
@@ -1098,21 +1434,62 @@ def build_pdf_report(
             story.append(Paragraph("<b>Parts</b>", styles["SectionHeader"]))
             story.append(Spacer(1, 6))
 
-            def _part_thumb(bbox):
-                """Create a simple proportional rectangle thumbnail representing bounding box."""
-                w = max(1, bbox[2] - bbox[0])
-                h = max(1, bbox[3] - bbox[1])
-                # Normalize to 120x120 canvas keeping aspect
+            def _part_thumb(part, outline_pts=None):
+                """Render an approximate outline preview instead of a plain rectangle."""
                 canvas_sz = 120
-                scale = min(canvas_sz / w, canvas_sz / h)
-                disp_w = int(w * scale)
-                disp_h = int(h * scale)
-                img = Image.new("RGB", (canvas_sz, canvas_sz), (236, 240, 244))  # light gray bg
-                d = ImageDraw.Draw(img)
-                left = (canvas_sz - disp_w) // 2
-                top = (canvas_sz - disp_h) // 2
-                d.rectangle([left, top, left + disp_w, top + disp_h], fill=(180, 192, 200))
-                # Optional id centered
+                padding = 8
+                bg_color = (236, 240, 244)
+                fg_color = (149, 164, 182)
+                img = Image.new("RGB", (canvas_sz, canvas_sz), bg_color)
+                draw = ImageDraw.Draw(img)
+
+                if outline_pts is None:
+                    outline_pts = _polygon_points_from_entity(part.get("outer"), auto_close=True)
+                if not outline_pts:
+                    bbox = part.get("orig_bbox") or part.get("placed_bbox") or (0, 0, 10, 10)
+                    outline_pts = [
+                        (bbox[0], bbox[1]),
+                        (bbox[2], bbox[1]),
+                        (bbox[2], bbox[3]),
+                        (bbox[0], bbox[3]),
+                    ]
+
+                xs = [p[0] for p in outline_pts]
+                ys = [p[1] for p in outline_pts]
+                min_x, max_x = min(xs), max(xs)
+                min_y, max_y = min(ys), max(ys)
+                width = max(1.0, max_x - min_x)
+                height = max(1.0, max_y - min_y)
+                scale = min((canvas_sz - 2 * padding) / width, (canvas_sz - 2 * padding) / height)
+
+                def _project(pt):
+                    px = (pt[0] - min_x) * scale + padding
+                    py = (pt[1] - min_y) * scale + padding
+                    # Flip vertically for display aesthetics
+                    return (px, canvas_sz - py)
+
+                outline_proj = [_project(pt) for pt in outline_pts]
+                if len(outline_proj) >= 3:
+                    draw.polygon(outline_proj, fill=(180, 192, 200), outline=fg_color)
+                else:
+                    draw.rectangle([padding, padding, canvas_sz - padding, canvas_sz - padding], fill=(180, 192, 200))
+
+                # Carve out holes
+                for hole in part.get("holes", []):
+                    hole_pts = _polygon_points_from_entity(hole, auto_close=True)
+                    if len(hole_pts) >= 3:
+                        draw.polygon([_project(pt) for pt in hole_pts], fill=bg_color, outline=fg_color)
+                for circ in part.get("circles", []):
+                    center = circ.get("center", (0, 0))
+                    radius = float(circ.get("radius", 0.0))
+                    if radius <= 0:
+                        continue
+                    left_top = _project((center[0] - radius, center[1] - radius))
+                    right_bottom = _project((center[0] + radius, center[1] + radius))
+                    lx, ly = left_top
+                    rx, ry = right_bottom
+                    bbox_draw = [(min(lx, rx), min(ly, ry)), (max(lx, rx), max(ly, ry))]
+                    draw.ellipse(bbox_draw, outline=fg_color, fill=bg_color)
                 return img
 
             for i, part in enumerate(sh, start=1):
@@ -1121,15 +1498,28 @@ def build_pdf_report(
                 ph_mm = max(0.0, bbox[3] - bbox[1])
                 pw_cm = pw_mm / 10.0
                 ph_cm = ph_mm / 10.0
-                perimeter_mm = 2 * (pw_mm + ph_mm)
+                perimeter_mm = part_perimeter_mm(part)
                 perimeter_m = perimeter_mm / 1000.0
-                area_cm2 = (pw_cm * ph_cm)
-                # External contour assumed 1; internal contours approximate from holes + circles
+                area_cm2 = part_surface_area_mm2(part) / 100.0
+                outline_pts = _polygon_points_from_entity(part.get("outer"), auto_close=True)
+                if not outline_pts:
+                    ob = part.get("orig_bbox") or part.get("placed_bbox") or (0, 0, 10, 10)
+                    outline_pts = [
+                        (ob[0], ob[1]),
+                        (ob[2], ob[1]),
+                        (ob[2], ob[3]),
+                        (ob[0], ob[3]),
+                    ]
+                # External contour assumed 1; internal contours count all classified + nested "others"
                 internal_cnt = len(part.get("holes", [])) + len(part.get("circles", [])) + len(part.get("arcs", []))
+                if outline_pts:
+                    internal_cnt += sum(
+                        1 for ent in part.get("others", []) if _entity_inside_polygon(ent, outline_pts)
+                    )
                 external_cnt = 1
                 name_val = part.get("label") or part.get("source_file") or f"Part {i}"
                 # Thumbnail image
-                thumb_img = _part_thumb(bbox)
+                thumb_img = _part_thumb(part, outline_pts)
                 b_io = io.BytesIO()
                 thumb_img.save(b_io, format="PNG")
                 b_io.seek(0)
@@ -1154,6 +1544,10 @@ def build_pdf_report(
                     else:
                         # r has 2 columns -> expand to 2 with span over third
                         table_data.append([r[0], r[1], ""])
+                table_data = [
+                    [_para_cell(cell, header=(ridx == 0)) for cell in row]
+                    for ridx, row in enumerate(table_data)
+                ]
                 # Widen first column to reduce wrapping; second narrower (value spans 2 & 3)
                 attr_tbl = Table(table_data, colWidths=[60*mm, 35*mm, 50*mm])
                 ts = [
@@ -1239,12 +1633,22 @@ def transform_entity(ent, origin, ang, tx, ty):
     return None
 
 
-def boxes_intersect(a, b):
-    return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
+def boxes_intersect(a, b, spacing: float = 0.0):
+    if spacing <= 0:
+        return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
+    pad = spacing / 2.0
+    a_expanded = (a[0] - pad, a[1] - pad, a[2] + pad, a[3] + pad)
+    b_expanded = (b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad)
+    return not (
+        a_expanded[2] <= b_expanded[0]
+        or a_expanded[0] >= b_expanded[2]
+        or a_expanded[3] <= b_expanded[1]
+        or a_expanded[1] >= b_expanded[3]
+    )
 
 
 def find_best_rotation_for_position(
-    part, x, y, placed_bboxes, sheet_w, sheet_h, spacing, rotations
+    part, x, y, placed_parts, sheet_w, sheet_h, spacing, rotations
 ):
     origin = part.get("centroid", part.get("origin", (0, 0)))
     entities = part["entities"]
@@ -1265,18 +1669,47 @@ def find_best_rotation_for_position(
 
         candidate = (x, y, x + bbox_w, y + bbox_h)
 
-        if all(not boxes_intersect(candidate, pb) for pb in placed_bboxes):
-            area = bbox_w * bbox_h
-            if area < best_area:
-                best_area = area
-                best_rotation = ang
-                best_bbox = (candidate, (x, y), rot_bbox)
+        candidate_outline = None
+        conflict = False
+        for existing in placed_parts:
+            pb = existing.get("placed_bbox")
+            if not pb:
+                continue
+            if not boxes_intersect(candidate, pb, spacing):
+                continue
+            existing_outline = existing.get("outline_polygon")
+            if existing_outline:
+                if candidate_outline is None:
+                    candidate_outline = build_outline_polygon(
+                        part,
+                        ang,
+                        x,
+                        y,
+                        rot_bbox,
+                    )
+                    if candidate_outline is None:
+                        conflict = True
+                        break
+                if polygons_intersect(candidate_outline, existing_outline):
+                    conflict = True
+                    break
+            else:
+                conflict = True
+                break
+        if conflict:
+            continue
+
+        area = bbox_w * bbox_h
+        if area < best_area:
+            best_area = area
+            best_rotation = ang
+            best_bbox = (candidate, (x, y), rot_bbox)
 
     return best_rotation, best_bbox
 
 
 def bottom_left_place_with_rotation(
-    part, placed_bboxes, sheet_w, sheet_h, spacing, rotations, aggressive=False
+    part, placed_parts, sheet_w, sheet_h, spacing, rotations, aggressive=False
 ):
     """
     Try to place `part` on the sheet using a bottom‑left heuristic.
@@ -1289,7 +1722,15 @@ def bottom_left_place_with_rotation(
     potential_xs = {spacing}
     potential_ys = {spacing}
 
-    for pb in placed_bboxes:
+    existing_bboxes = [p["placed_bbox"] for p in placed_parts if p.get("placed_bbox")]
+    current_max_x = max((bb[2] for bb in existing_bboxes), default=spacing)
+    current_max_y = max((bb[3] for bb in existing_bboxes), default=spacing)
+    base_extent_x = max(current_max_x, spacing)
+    base_extent_y = max(current_max_y, spacing)
+    base_extent_area = base_extent_x * base_extent_y
+
+    for existing in placed_parts:
+        pb = existing.get("placed_bbox") or (spacing, spacing, spacing, spacing)
         # Right / top edges
         potential_xs.add(pb[2] + spacing)
         potential_ys.add(pb[3] + spacing)
@@ -1307,16 +1748,26 @@ def bottom_left_place_with_rotation(
     for y in sorted_ys:
         for x in sorted_xs:
             rotation, bbox_info = find_best_rotation_for_position(
-                part, x, y, placed_bboxes, sheet_w, sheet_h, spacing, rotations
+                part, x, y, placed_parts, sheet_w, sheet_h, spacing, rotations
             )
             if rotation is None or bbox_info is None:
                 continue
 
             candidate, anchor, rot_bbox = bbox_info
 
-            # Score: lower Y (bottom), then lower X (left), then smaller bbox area.
             area = calculate_bbox_area(candidate)
-            score = (candidate[3], candidate[0], area)
+            new_extent_x = max(candidate[2], base_extent_x)
+            new_extent_y = max(candidate[3], base_extent_y)
+            new_extent_area = new_extent_x * new_extent_y
+            area_increase = max(new_extent_area - base_extent_area, 0.0)
+            score = (
+                area_increase,
+                new_extent_y,
+                new_extent_x,
+                candidate[3],
+                candidate[0],
+                area,
+            )
 
             if best_score is None or score < best_score:
                 best_score = score
@@ -1334,7 +1785,7 @@ def nest_parts_improved(
     free_rotation=False,
     advanced_sort=True,
     enable_compaction=True,
-    rotation_prune_tolerance=0.05,
+    rotation_prune_tolerance=0.0,
     aggressive_packing=True,
 ):
     """
@@ -1433,11 +1884,10 @@ def nest_parts_improved(
 
         # Try existing sheets first
         for sheet in sheets:
-            placed_bboxes = [x["placed_bbox"] for x in sheet]
             rotation_list = part.get("rotation_candidates", rotation_angles)
             placement = bottom_left_place_with_rotation(
                 part,
-                placed_bboxes,
+            sheet,
                 sheet_w,
                 sheet_h,
                 spacing,
@@ -1446,6 +1896,13 @@ def nest_parts_improved(
             )
             if placement:
                 rotation, candidate, anchor, rot_bbox = placement
+                outline_polygon = build_outline_polygon(
+                    part,
+                    rotation,
+                    anchor[0],
+                    anchor[1],
+                    rot_bbox,
+                )
                 inst = part.copy()
                 inst.update(
                     {
@@ -1455,6 +1912,7 @@ def nest_parts_improved(
                         "anchor_Y": anchor[1],
                         "rotation_origin": part["centroid"],
                         "rotated_min": (rot_bbox[0], rot_bbox[1]),
+                        "outline_polygon": outline_polygon,
                     }
                 )
                 sheet.append(inst)
@@ -1475,6 +1933,13 @@ def nest_parts_improved(
             )
             if placement:
                 rotation, candidate, anchor, rot_bbox = placement
+                outline_polygon = build_outline_polygon(
+                    part,
+                    rotation,
+                    anchor[0],
+                    anchor[1],
+                    rot_bbox,
+                )
                 inst = part.copy()
                 inst.update(
                     {
@@ -1484,6 +1949,7 @@ def nest_parts_improved(
                         "anchor_Y": anchor[1],
                         "rotation_origin": part["centroid"],
                         "rotated_min": (rot_bbox[0], rot_bbox[1]),
+                        "outline_polygon": outline_polygon,
                     }
                 )
                 sheets.append([inst])
@@ -1528,6 +1994,12 @@ def nest_parts_improved(
                         part["placed_bbox"] = (new_x, new_y, new_x + w, new_y + h)
                         part["anchor_X"] = new_x
                         part["anchor_Y"] = new_y
+                        part["outline_polygon"] = build_outline_polygon(
+                            part,
+                            part.get("rotation", 0),
+                            new_x,
+                            new_y,
+                        )
 
             # Fine sliding in small steps
             step = max(1.0, spacing)
@@ -1544,7 +2016,10 @@ def nest_parts_improved(
                     target_x = bx[0]
                     while target_x - step >= spacing:
                         cand = (target_x - step, bx[1], target_x - step + w, bx[3])
-                        if all(not boxes_intersect(cand, o) for o in others):
+                        if all(
+                            not boxes_intersect(cand, o, spacing)
+                            for o in others
+                        ):
                             target_x -= step
                         else:
                             break
@@ -1553,7 +2028,10 @@ def nest_parts_improved(
                     target_y = bx[1]
                     while target_y - step >= spacing:
                         cand = (bx[0], target_y - step, bx[2], target_y - step + h)
-                        if all(not boxes_intersect(cand, o) for o in others):
+                        if all(
+                            not boxes_intersect(cand, o, spacing)
+                            for o in others
+                        ):
                             target_y -= step
                         else:
                             break
@@ -1567,6 +2045,12 @@ def nest_parts_improved(
                         )
                         part["anchor_X"] = target_x
                         part["anchor_Y"] = target_y
+                        part["outline_polygon"] = build_outline_polygon(
+                            part,
+                            part.get("rotation", 0),
+                            target_x,
+                            target_y,
+                        )
                         moved = True
 
         for sh in sheets:
@@ -1585,7 +2069,7 @@ def nest_parts_improved(
                     rotation_list = part.get("rotation_candidates", rotation_angles)
                     placement = bottom_left_place_with_rotation(
                         part,
-                        [p["placed_bbox"] for p in earlier],
+                        earlier,
                         sheet_w,
                         sheet_h,
                         spacing,
@@ -1594,6 +2078,13 @@ def nest_parts_improved(
                     )
                     if placement:
                         rotation, candidate, anchor, rot_bbox = placement
+                        outline_polygon = build_outline_polygon(
+                            part,
+                            rotation,
+                            anchor[0],
+                            anchor[1],
+                            rot_bbox,
+                        )
                         inst = part.copy()
                         inst.update(
                             {
@@ -1605,6 +2096,7 @@ def nest_parts_improved(
                                     "centroid", part.get("origin", (0, 0))
                                 ),
                                 "rotated_min": (rot_bbox[0], rot_bbox[1]),
+                                "outline_polygon": outline_polygon,
                             }
                         )
                         earlier.append(inst)
@@ -1829,6 +2321,13 @@ def nest_parts_improved(
                         anchor_x + pw,
                         anchor_y + ph,
                     )
+                    outline_polygon = build_outline_polygon(
+                        part,
+                        chosen_ang,
+                        anchor_x,
+                        anchor_y,
+                        rot_bbox,
+                    )
                     inst = part.copy()
                     inst.update(
                         {
@@ -1840,6 +2339,7 @@ def nest_parts_improved(
                                 "centroid", part.get("origin", (0, 0))
                             ),
                             "rotated_min": (rot_bbox[0], rot_bbox[1]),
+                            "outline_polygon": outline_polygon,
                         }
                     )
                     sheet["parts"].append(inst)
@@ -1877,6 +2377,13 @@ def nest_parts_improved(
                         anchor_x + pw,
                         anchor_y + ph,
                     )
+                    outline_polygon = build_outline_polygon(
+                        part,
+                        ang,
+                        anchor_x,
+                        anchor_y,
+                        rot_bbox,
+                    )
                     inst = part.copy()
                     inst.update(
                         {
@@ -1888,6 +2395,7 @@ def nest_parts_improved(
                                 "centroid", part.get("origin", (0, 0))
                             ),
                             "rotated_min": (rot_bbox[0], rot_bbox[1]),
+                            "outline_polygon": outline_polygon,
                         }
                     )
                     sheet["parts"].append(inst)
@@ -1922,83 +2430,126 @@ def nest_parts_improved(
     return sheets
 
 
+def _add_sheet_to_modelspace(
+    msp,
+    sheet,
+    sheet_w,
+    sheet_h,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    sheet_idx: int = 1,
+):
+    width = float(sheet_w or 0.0)
+    height = float(sheet_h or 0.0)
+    outline = [
+        (offset_x, offset_y),
+        (offset_x + width, offset_y),
+        (offset_x + width, offset_y + height),
+        (offset_x, offset_y + height),
+    ]
+    msp.add_lwpolyline(
+        outline,
+        close=True,
+        dxfattribs={"layer": f"SHEET_{sheet_idx:03d}"},
+    )
+    for part in sheet:
+        ang = part.get("rotation", 0)
+        anchor_x = part.get("anchor_X", 0)
+        anchor_y = part.get("anchor_Y", 0)
+        origin = part.get("rotation_origin", (0, 0))
+        rot_min = part.get("rotated_min", (0, 0))
+        tx = anchor_x - rot_min[0] + offset_x
+        ty = anchor_y - rot_min[1] + offset_y
+
+        if part.get("outer"):
+            o = transform_entity(part["outer"], origin, ang, tx, ty)
+            if o and o["type"] == "LWPOLYLINE":
+                msp.add_lwpolyline(o["points"], close=o.get("closed", False))
+
+        for (ent, offset) in part.get("relative_offsets", []):
+            rot_off = rotate_point_around((0, 0), offset, ang)
+            tx2 = tx + rot_off[0]
+            ty2 = ty + rot_off[1]
+            ent2 = transform_entity(ent, origin, ang, tx2, ty2)
+            if not ent2:
+                continue
+            if ent2["type"] == "LWPOLYLINE":
+                msp.add_lwpolyline(
+                    ent2["points"], close=ent2.get("closed", False)
+                )
+            elif ent2["type"] == "CIRCLE":
+                msp.add_circle(ent2["center"], ent2["radius"])
+            elif ent2["type"] == "ARC":
+                msp.add_arc(
+                    ent2["center"],
+                    ent2["radius"],
+                    ent2["start_angle"],
+                    ent2["end_angle"],
+                )
+            elif ent2["type"] == "SPLINE":
+                msp.add_lwpolyline(ent2["points"], close=False)
+
+        for ent in part.get("entities", []):
+            if ent in [part.get("outer")] + [
+                e for e, _ in part.get("relative_offsets", [])
+            ]:
+                continue
+            t = ent["type"]
+            e2 = transform_entity(ent, origin, ang, tx, ty)
+            if not e2:
+                continue
+            if t == "LWPOLYLINE":
+                msp.add_lwpolyline(e2["points"], close=e2.get("closed", False))
+            elif t == "CIRCLE":
+                msp.add_circle(e2["center"], e2["radius"])
+            elif t == "LINE":
+                msp.add_line(e2["start"], e2["end"])
+            elif t == "ARC":
+                msp.add_arc(
+                    e2["center"],
+                    e2["radius"],
+                    e2["start_angle"],
+                    e2["end_angle"],
+                )
+            elif t == "SPLINE":
+                msp.add_lwpolyline(e2["points"], close=False)
+
+
 def write_sheets_entities_to_dxf(sheets, base_output, sheet_w, sheet_h):
     for idx, sheet in enumerate(sheets, start=1):
         doc = getattr(ezdxf, "new")("R2010")
         msp = doc.modelspace()
-        msp.add_lwpolyline(
-            [(0, 0), (sheet_w, 0), (sheet_w, sheet_h), (0, sheet_h)],
-            close=True,
-            dxfattribs={"layer": "SHEET"},
-        )
-        for part in sheet:
-            ang = part.get("rotation", 0)
-            anchor_x = part.get("anchor_X", 0)
-            anchor_y = part.get("anchor_Y", 0)
-            origin = part.get("rotation_origin", (0, 0))
-            rot_min = part.get("rotated_min", (0, 0))
-            tx = anchor_x - rot_min[0]
-            ty = anchor_y - rot_min[1]
-
-            if part.get("outer"):
-                o = transform_entity(part["outer"], origin, ang, tx, ty)
-                if o and o["type"] == "LWPOLYLINE":
-                    pts = [(p[0], p[1]) for p in o["points"]]
-                    msp.add_lwpolyline(pts, close=o.get("closed", False))
-
-            for (ent, offset) in part.get("relative_offsets", []):
-                rot_off = rotate_point_around((0, 0), offset, ang)
-                tx2 = tx + rot_off[0]
-                ty2 = ty + rot_off[1]
-                ent2 = transform_entity(ent, origin, ang, tx2, ty2)
-                if not ent2:
-                    continue
-                if ent2["type"] == "LWPOLYLINE":
-                    msp.add_lwpolyline(
-                        ent2["points"], close=ent2.get("closed", False)
-                    )
-                elif ent2["type"] == "CIRCLE":
-                    msp.add_circle(ent2["center"], ent2["radius"])
-                elif ent2["type"] == "ARC":
-                    msp.add_arc(
-                        ent2["center"],
-                        ent2["radius"],
-                        ent2["start_angle"],
-                        ent2["end_angle"],
-                    )
-                elif ent2["type"] == "SPLINE":
-                    msp.add_lwpolyline(ent2["points"], close=False)
-
-            for ent in part.get("entities", []):
-                if ent in [part.get("outer")] + [
-                    e for e, _ in part.get("relative_offsets", [])
-                ]:
-                    continue
-                t = ent["type"]
-                e2 = transform_entity(ent, origin, ang, tx, ty)
-                if not e2:
-                    continue
-                if t == "LWPOLYLINE":
-                    msp.add_lwpolyline(e2["points"], close=e2.get("closed", False))
-                elif t == "CIRCLE":
-                    msp.add_circle(e2["center"], e2["radius"])
-                elif t == "LINE":
-                    msp.add_line(e2["start"], e2["end"])
-                elif t == "ARC":
-                    msp.add_arc(
-                        e2["center"],
-                        e2["radius"],
-                        e2["start_angle"],
-                        e2["end_angle"],
-                    )
-                elif t == "SPLINE":
-                    msp.add_lwpolyline(e2["points"], close=False)
+        _add_sheet_to_modelspace(msp, sheet, sheet_w, sheet_h, sheet_idx=idx)
         out_path = f"{base_output}_sheet{idx:03d}.dxf"
         try:
             doc.saveas(out_path)
             print("Saved:", out_path)
         except Exception as ex:
             print("Error saving:", ex)
+
+
+def build_multi_sheet_dxf_bytes(sheets, sheet_w, sheet_h, gap_mm: float = 50.0):
+    if not sheets:
+        raise ValueError("No sheets provided for DXF export")
+    doc = getattr(ezdxf, "new")("R2010")
+    msp = doc.modelspace()
+    width = float(sheet_w or 0.0)
+    spacing = max(gap_mm, width * 0.05) if width > 0 else gap_mm
+    for idx, sheet in enumerate(sheets, start=1):
+        offset_x = (idx - 1) * (width + spacing)
+        _add_sheet_to_modelspace(msp, sheet, sheet_w, sheet_h, offset_x=offset_x, sheet_idx=idx)
+    fd, temp_path = tempfile.mkstemp(suffix=".dxf", prefix="ei8_multi_")
+    os.close(fd)
+    try:
+        doc.saveas(temp_path)
+        with open(temp_path, "rb") as fh:
+            data = fh.read()
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+    return data
 
 
 # -----------------------
@@ -2973,7 +3524,7 @@ with col_c:
                             )
                             # Utilization metrics
                             def _sheet_util(sh):
-                                area_sum = sum(calculate_bbox_area(p.get("placed_bbox", (0,0,0,0))) for p in sh)
+                                area_sum = sum(part_surface_area_mm2(p) for p in sh)
                                 sheet_area = sheet_w * sheet_h
                                 return (area_sum / sheet_area * 100.0) if sheet_area > 0 else 0.0
                             utils = [_sheet_util(sh) for sh in sheets]
@@ -3039,6 +3590,7 @@ with col_c:
                 "spacing": float(cfg_inputs.get("spacing", DEFAULT_SPACING)),
                 "kerf": float(cfg_inputs.get("kerf", DEFAULT_KERF)),
             }
+            project_stub = _current_project_file_stub()
 
             preview_canvas_px = int(cfg_inputs.get("preview_canvas_px", 900))
             show_bbox = bool(cfg_inputs.get("show_bbox", True))
@@ -3104,6 +3656,26 @@ with col_c:
                     f"Showing: {int(st.session_state.sheet_nav_number)}/{len(sheets)}"
                 )
             st.markdown("</div>", unsafe_allow_html=True)
+
+            total_parts_area_all = sum(
+                calculate_bbox_area(p.get("placed_bbox", (0, 0, 0, 0)))
+                for sh in sheets
+                for p in sh
+            )
+            sheet_w = cfg.get("sheet_w") or 0
+            sheet_h = cfg.get("sheet_h") or 0
+            sheet_area = sheet_w * sheet_h if sheet_w and sheet_h else 0
+            total_sheet_area = sheet_area * len(sheets)
+            overall_efficiency_pct = (
+                (total_parts_area_all / total_sheet_area) * 100.0
+                if total_sheet_area
+                else 0.0
+            )
+            total_parts_count = sum(len(sh) for sh in sheets)
+            summary_cols = st.columns(3)
+            summary_cols[0].metric("Overall utilization", f"{overall_efficiency_pct:.1f}%")
+            summary_cols[1].metric("Total sheets", len(sheets))
+            summary_cols[2].metric("Placed parts", total_parts_count)
 
             sheet_idx = int(st.session_state.sheet_nav_number)
             selected = sheets[sheet_idx - 1]
@@ -3186,10 +3758,11 @@ with col_c:
                             )
                         html.append("</table></body></html>")
                         data_bytes = "\n".join(html).encode("utf-8")
+                        summary_fname = f"{project_stub}_parts_summary.xls"
                         st.download_button(
-                            "Download parts_summary.xls",
+                            f"Download {summary_fname}",
                             data=data_bytes,
-                            file_name="parts_summary.xls",
+                            file_name=summary_fname,
                             mime="application/vnd.ms-excel",
                             use_container_width=True,
                         )
@@ -3276,7 +3849,7 @@ with col_c:
                     key="export_format",
                 )
             with scope_col:
-                if export_format in ("ZIP (.zip)", "Excel (.xls)", "PDF (.pdf)"):
+                if export_format in ("ZIP (.zip)", "Excel (.xls)", "PDF (.pdf)", "DXF (.dxf)"):
                     export_scope = st.radio(
                         "Scope",
                         ["All sheets", "Single sheet"],
@@ -3347,9 +3920,9 @@ with col_c:
                                     pass
                         zip_buf.seek(0)
                         zip_name = (
-                            "nested_sheets.zip"
+                            f"{project_stub}_sheets.zip"
                             if export_scope == "All sheets"
-                            else f"nested_sheet{sel_idx:03d}.zip"
+                            else f"{project_stub}_sheet{sel_idx:03d}.zip"
                         )
                         st.download_button(
                             f"Download {zip_name}",
@@ -3364,46 +3937,36 @@ with col_c:
                         st.exception(e)
 
             elif export_format == "DXF (.dxf)":
-                if st.button(
-                    f"Prepare DXF (sheet {sel_idx})",
-                    key="dxf_btn",
-                    use_container_width=True,
-                ):
+                btn_label = (
+                    "Prepare DXF (all sheets)"
+                    if export_scope == "All sheets"
+                    else f"Prepare DXF (sheet {sel_idx})"
+                )
+                if st.button(btn_label, key="dxf_btn", use_container_width=True):
                     try:
-                        temp_dir = tempfile.mkdtemp(prefix="ei8_nest_")
-                        try:
-                            base_out = os.path.join(temp_dir, "single_out")
-                            write_sheets_entities_to_dxf(
-                                [sheets[sel_idx - 1]],
-                                base_out,
-                                cfg["sheet_w"],
-                                cfg["sheet_h"],
-                            )
-                            dxf_path = None
-                            for fname in os.listdir(temp_dir):
-                                if fname.lower().endswith(".dxf"):
-                                    dxf_path = os.path.join(temp_dir, fname)
-                                    break
-                            if not dxf_path:
-                                raise RuntimeError("DXF not generated")
-                            with open(dxf_path, "rb") as fh:
-                                data_bytes = fh.read()
-                            out_name = f"nested_sheet{sel_idx:03d}.dxf"
-                            st.download_button(
-                                f"Download {out_name}",
-                                data=data_bytes,
-                                file_name=out_name,
-                                mime="application/octet-stream",
-                                use_container_width=True,
-                            )
-                            st.toast("📄 DXF ready", icon="📄")
-                        finally:
-                            try:
-                                for fname in os.listdir(temp_dir):
-                                    os.remove(os.path.join(temp_dir, fname))
-                                os.rmdir(temp_dir)
-                            except Exception:
-                                pass
+                        target = (
+                            sheets
+                            if export_scope == "All sheets"
+                            else [sheets[sel_idx - 1]]
+                        )
+                        dxf_bytes = build_multi_sheet_dxf_bytes(
+                            target,
+                            cfg.get("sheet_w"),
+                            cfg.get("sheet_h"),
+                        )
+                        out_name = (
+                            f"{project_stub}.dxf"
+                            if export_scope == "All sheets"
+                            else f"{project_stub}_sheet{sel_idx:03d}.dxf"
+                        )
+                        st.download_button(
+                            f"Download {out_name}",
+                            data=dxf_bytes,
+                            file_name=out_name,
+                            mime="application/octet-stream",
+                            use_container_width=True,
+                        )
+                        st.toast("📄 DXF ready", icon="📄")
                     except Exception as e:
                         st.error(f"Export failed: {e}")
                         st.exception(e)
@@ -3447,10 +4010,15 @@ with col_c:
                                 logo_bytes=logo_bytes,
                                 title_text=title_text,
                             )
+                            pdf_name = (
+                                f"{project_stub}.pdf"
+                                if export_scope == "All sheets"
+                                else f"{project_stub}_sheet{sel_idx:03d}.pdf"
+                            )
                             st.download_button(
-                                "Download report.pdf" if export_scope == "All sheets" else f"Download report_sheet{sel_idx:03d}.pdf",
+                                f"Download {pdf_name}",
                                 data=data,
-                                file_name=("report.pdf" if export_scope == "All sheets" else f"report_sheet{sel_idx:03d}.pdf"),
+                                file_name=pdf_name,
                                 mime="application/pdf",
                                 use_container_width=True,
                             )
@@ -3487,10 +4055,11 @@ with col_c:
                                     append_images=rest,
                                 )
                                 pdf_buf.seek(0)
+                                pdf_name = f"{project_stub}_preview.pdf"
                                 st.download_button(
-                                    "Download nesting_all_sheets.pdf",
+                                    f"Download {pdf_name}",
                                     data=pdf_buf.getvalue(),
-                                    file_name="nesting_all_sheets.pdf",
+                                    file_name=pdf_name,
                                     mime="application/pdf",
                                     use_container_width=True,
                                 )
@@ -3512,7 +4081,7 @@ with col_c:
                                     img = img.convert("RGB")
                                 img.save(pdf_buf, format="PDF")
                                 pdf_buf.seek(0)
-                                out_name = f"nested_sheet{sel_idx:03d}.pdf"
+                                out_name = f"{project_stub}_sheet{sel_idx:03d}_preview.pdf"
                                 st.download_button(
                                     f"Download {out_name}",
                                     data=pdf_buf.getvalue(),
@@ -3546,9 +4115,7 @@ with col_c:
                         ):
                             sheet_area = cfg["sheet_w"] * cfg["sheet_h"]
                             part_area_sum = sum(
-                                calculate_bbox_area(
-                                    p.get("placed_bbox", (0, 0, 0, 0))
-                                )
+                                part_surface_area_mm2(p)
                                 for p in sheet
                             )
                             utilization = (
@@ -3618,9 +4185,9 @@ with col_c:
                         html.append("</table></body></html>")
                         data_bytes = "\n".join(html).encode("utf-8")
                         fname = (
-                            "nested_summary.xls"
+                            f"{project_stub}_summary.xls"
                             if export_scope == "All sheets"
-                            else f"nested_sheet{sel_idx:03d}_summary.xls"
+                            else f"{project_stub}_sheet{sel_idx:03d}_summary.xls"
                         )
                         st.download_button(
                             f"Download {fname}",
