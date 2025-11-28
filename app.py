@@ -17,13 +17,14 @@ import random
 import json
 import datetime
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 import numpy as np
 import ezdxf
 from PIL import Image, ImageDraw
 import streamlit as st  # type: ignore
 import base64
 import html
+
 try:
     import pandas as pd  # for Excel export
 except ImportError:
@@ -59,7 +60,7 @@ DEFAULT_EXTERNAL_LOGO_PATH = "/mnt/data/.png"
 DEFAULT_SHEET_W = 1000.0
 DEFAULT_SHEET_H = 1000.0
 DEFAULT_SPACING = 5.0
-DEFAULT_KERF = 0.0
+DEFAULT_BORDER_SPACING = 0.0
 DEFAULT_ROT_STEP = 15
 DEFAULT_QTY = 1
 PROJECTS_ROOT = "projects"
@@ -144,11 +145,10 @@ def _create_new_project(initial_name: str = None):
         "sheet_w": DEFAULT_SHEET_W,
         "sheet_h": DEFAULT_SHEET_H,
         "spacing": DEFAULT_SPACING,
-        "kerf": DEFAULT_KERF,
+        "border_spacing": DEFAULT_BORDER_SPACING,
         "rotation_mode": "Free Rotation (Optimized)",
         "rotation_step": DEFAULT_ROT_STEP,
         "preview_canvas_px": 900,
-        "show_bbox": True,
         "show_outline": True,
     }
     st.session_state.uploader_snapshot = None
@@ -251,7 +251,7 @@ def _load_project(pid: str):
         return True
     except Exception:
         return False
-FREE_ROTATION_SAMPLES = 36  # Number of angles to test for free rotation
+FREE_ROTATION_SAMPLES = 72  # Number of angles to test for free rotation
 
 
 def debug(msg):
@@ -352,7 +352,6 @@ def polygon_area(points):
         area += x1 * y2 - x2 * y1
     return abs(area) / 2.0
 
-
 def _bulge_arc_points(p1, p2, bulge, max_seg_deg=10):
     """Approximate an arc segment defined by bulge with intermediate points."""
     if abs(bulge) < 1e-6:
@@ -434,6 +433,13 @@ def _polygon_points_from_entity(entity, auto_close=True):
         if auto_close and pts and pts[0] != pts[-1]:
             pts.append(pts[0])
         return pts
+    if etype == "CIRCLE":
+        center = entity.get("center", (0.0, 0.0))
+        radius = float(entity.get("radius", 0.0))
+        pts = _circle_points(center, radius)
+        if not auto_close and pts and pts[0] == pts[-1]:
+            pts = pts[:-1]
+        return pts
     return []
 
 
@@ -466,6 +472,18 @@ def _entity_reference_point(entity):
         ex, ey = entity["end"]
         return ((sx + ex) / 2.0, (sy + ey) / 2.0)
     return None
+def _circle_points(center, radius, segments=72):
+    if radius <= 0:
+        return []
+    seg = max(12, int(segments))
+    pts = []
+    for i in range(seg):
+        ang = 2.0 * math.pi * (i / seg)
+        pts.append((center[0] + radius * math.cos(ang), center[1] + radius * math.sin(ang)))
+    pts.append(pts[0])
+    return pts
+
+
 
 
 def _entity_inside_polygon(entity, polygon_pts):
@@ -475,6 +493,254 @@ def _entity_inside_polygon(entity, polygon_pts):
     if not ref:
         return False
     return point_in_polygon(ref, polygon_pts)
+
+
+def _points_close(a, b, tol=1e-3):
+    if a is None or b is None:
+        return False
+    dx = a[0] - b[0]
+    dy = a[1] - b[1]
+    return (dx * dx + dy * dy) <= tol * tol
+
+
+def _segment_points_from_entity(entity, max_arc_seg_deg=10):
+    if not entity:
+        return None
+    etype = entity.get("type")
+    if etype == "LINE":
+        start = entity.get("start")
+        end = entity.get("end")
+        if start and end:
+            return [start, end]
+        return None
+    if etype == "ARC":
+        center = entity.get("center")
+        radius = float(entity.get("radius", 0.0))
+        if not center or radius <= 0:
+            return None
+        start_angle = float(entity.get("start_angle", 0.0))
+        end_angle = float(entity.get("end_angle", 0.0))
+        start_rad = math.radians(start_angle)
+        end_rad = math.radians(end_angle)
+        sweep = end_rad - start_rad
+        if abs(sweep) < 1e-9:
+            sweep = 2.0 * math.pi
+        elif sweep <= 0:
+            sweep += 2.0 * math.pi
+        segments = max(4, int(abs(sweep) / math.radians(max_arc_seg_deg)))
+        pts = []
+        for i in range(segments + 1):
+            ang = start_rad + sweep * (i / segments)
+            pts.append((center[0] + radius * math.cos(ang), center[1] + radius * math.sin(ang)))
+        return pts
+    return None
+
+
+def _dedupe_points(points, tol=1e-6):
+    cleaned = []
+    for pt in points or []:
+        if not cleaned or not _points_close(pt, cleaned[-1], tol):
+            cleaned.append(pt)
+    return cleaned
+
+
+def _most_common_layer(layers):
+    if not layers:
+        return ""
+    counter = Counter(layer or "" for layer in layers)
+    most_common = counter.most_common(1)
+    return most_common[0][0] if most_common else ""
+
+
+def _synthesize_closed_polylines_from_segments(entities, tol=1e-3, max_arc_seg_deg=10):
+    segments = []
+    for ent in entities or []:
+        pts = _segment_points_from_entity(ent, max_arc_seg_deg=max_arc_seg_deg)
+        if pts and len(pts) >= 2:
+            segments.append({"points": pts, "layer": ent.get("layer", "")})
+    if not segments:
+        return []
+
+    unused = segments[:]
+    synthetic = []
+    while unused:
+        seg = unused.pop()
+        loop_pts = list(seg["points"])
+        loop_layers = [seg["layer"]]
+        if _points_close(loop_pts[0], loop_pts[-1], tol):
+            closed = True
+        else:
+            closed = False
+        while not closed and unused:
+            match_idx = None
+            reverse = False
+            for idx, cand in enumerate(unused):
+                if _points_close(loop_pts[-1], cand["points"][0], tol):
+                    match_idx = idx
+                    reverse = False
+                    break
+                if _points_close(loop_pts[-1], cand["points"][-1], tol):
+                    match_idx = idx
+                    reverse = True
+                    break
+            if match_idx is None:
+                break
+            cand = unused.pop(match_idx)
+            pts = list(reversed(cand["points"])) if reverse else list(cand["points"])
+            loop_pts.extend(pts[1:])
+            loop_layers.append(cand["layer"])
+            if _points_close(loop_pts[0], loop_pts[-1], tol):
+                closed = True
+                break
+        if closed:
+            cleaned = _dedupe_points(loop_pts)
+            if cleaned and _points_close(cleaned[0], cleaned[-1], tol):
+                cleaned = cleaned[:-1]
+            if len(cleaned) >= 3:
+                layer = _most_common_layer(loop_layers)
+                synthetic.append(
+                    {
+                        "type": "LWPOLYLINE",
+                        "points": cleaned,
+                        "bulges": [0.0] * len(cleaned),
+                        "closed": True,
+                        "layer": layer,
+                        "_synthetic_loop": True,
+                    }
+                )
+    return synthetic
+
+
+def _is_contour_entity(ent):
+    if not ent:
+        return False
+    etype = ent.get("type")
+    if etype == "LWPOLYLINE":
+        pts = ent.get("points", [])
+        return len(pts) >= 3
+    if etype == "SPLINE":
+        pts = ent.get("points", [])
+        return len(pts) >= 3
+    if etype == "CIRCLE":
+        return True
+    return False
+
+
+def _contour_nodes_from_entities(entities, area_tol=1e-2):
+    nodes = []
+    for ent in entities or []:
+        if not _is_contour_entity(ent):
+            continue
+        pts = _polygon_points_from_entity(ent, auto_close=True)
+        if len(pts) < 3:
+            continue
+        area = polygon_area(pts)
+        if area <= area_tol:
+            continue
+        node = {
+            "entity": ent,
+            "points": pts,
+            "area": area,
+            "centroid": polygon_centroid(pts),
+            "parent": None,
+            "children": [],
+            "depth": 0,
+        }
+        nodes.append(node)
+
+    if not nodes:
+        return []
+
+    for node in nodes:
+        for other in nodes:
+            if node is other:
+                continue
+            if other["area"] <= node["area"]:
+                continue
+            if point_in_polygon(node["centroid"], other["points"]):
+                current_parent = node.get("parent")
+                if current_parent is None or other["area"] < current_parent["area"]:
+                    node["parent"] = other
+    for node in nodes:
+        parent = node.get("parent")
+        if parent:
+            parent.setdefault("children", []).append(node)
+
+    def _assign_depth(node, depth):
+        node["depth"] = depth
+        for child in node.get("children", []):
+            _assign_depth(child, depth + 1)
+
+    for root in [n for n in nodes if n.get("parent") is None]:
+        _assign_depth(root, 0)
+    return nodes
+
+
+def _iter_contour_descendants(node):
+    for child in node.get("children", []):
+        yield child
+        yield from _iter_contour_descendants(child)
+
+
+def _attach_contour_as_hole(part, entity):
+    etype = entity.get("type")
+    if etype == "CIRCLE":
+        part["circles"].append(entity)
+    elif etype in {"LWPOLYLINE", "SPLINE"}:
+        part["holes"].append(entity)
+    else:
+        part["others"].append(entity)
+
+
+def _build_parts_from_contours(nodes, all_entities):
+    if not nodes:
+        return []
+    roots = [n for n in nodes if n.get("parent") is None]
+    if not roots:
+        return []
+
+    contour_ids = {id(n["entity"]) for n in nodes}
+    parts = []
+    for root in roots:
+        part = {
+            "outer": root["entity"],
+            "holes": [],
+            "circles": [],
+            "arcs": [],
+            "splines": [],
+            "others": [],
+        }
+        for desc in _iter_contour_descendants(root):
+            depth_diff = desc["depth"] - root["depth"]
+            if depth_diff <= 0:
+                continue
+            if depth_diff % 2 == 1:
+                _attach_contour_as_hole(part, desc["entity"])
+        parts.append({"node": root, "part": part})
+
+    assigned_ids = set()
+    for entry in parts:
+        part = entry["part"]
+        outline_pts = entry["node"]["points"]
+        for ent in all_entities or []:
+            ent_id = id(ent)
+            if ent_id in contour_ids or ent_id in assigned_ids:
+                continue
+            if _entity_inside_polygon(ent, outline_pts):
+                etype = ent.get("type")
+                if etype == "CIRCLE":
+                    part["circles"].append(ent)
+                elif etype == "ARC":
+                    part["arcs"].append(ent)
+                elif etype == "SPLINE":
+                    part["splines"].append(ent)
+                elif etype == "LWPOLYLINE":
+                    part["holes"].append(ent)
+                else:
+                    part["others"].append(ent)
+                assigned_ids.add(ent_id)
+
+    return [entry["part"] for entry in parts]
 
 
 def _segments_intersect(p1, p2, p3, p4):
@@ -508,17 +774,55 @@ def _segments_intersect(p1, p2, p3, p4):
     return False
 
 
+def _point_segment_distance_sq(pt, seg_a, seg_b):
+    if seg_a == seg_b:
+        return (pt[0] - seg_a[0]) ** 2 + (pt[1] - seg_a[1]) ** 2
+    ax, ay = seg_a
+    bx, by = seg_b
+    px, py = pt
+    abx = bx - ax
+    aby = by - ay
+    apx = px - ax
+    apy = py - ay
+    ab_len_sq = abx * abx + aby * aby
+    if ab_len_sq <= 1e-12:
+        return (px - ax) ** 2 + (py - ay) ** 2
+    t = (apx * abx + apy * aby) / ab_len_sq
+    t = max(0.0, min(1.0, t))
+    closest_x = ax + abx * t
+    closest_y = ay + aby * t
+    dx = px - closest_x
+    dy = py - closest_y
+    return dx * dx + dy * dy
+
+
+def _segments_distance_sq(p1, p2, p3, p4):
+    if _segments_intersect(p1, p2, p3, p4):
+        return 0.0
+    return min(
+        _point_segment_distance_sq(p1, p3, p4),
+        _point_segment_distance_sq(p2, p3, p4),
+        _point_segment_distance_sq(p3, p1, p2),
+        _point_segment_distance_sq(p4, p1, p2),
+    )
+
+
+def _close_polygon(poly):
+    if not poly:
+        return []
+    if len(poly) < 2:
+        return poly[:]
+    if poly[0] == poly[-1]:
+        return poly[:]
+    return poly + [poly[0]]
+
+
 def polygons_intersect(poly_a, poly_b):
     if not poly_a or not poly_b:
         return False
 
-    def _close(poly):
-        if len(poly) < 2:
-            return poly
-        return poly + [poly[0]] if poly[0] != poly[-1] else poly
-
-    pa = _close(poly_a)
-    pb = _close(poly_b)
+    pa = _close_polygon(poly_a)
+    pb = _close_polygon(poly_b)
 
     for i in range(len(pa) - 1):
         for j in range(len(pb) - 1):
@@ -529,6 +833,23 @@ def polygons_intersect(poly_a, poly_b):
         return True
     if point_in_polygon(pb[0], pa):
         return True
+    return False
+
+
+def polygons_overlap_with_spacing(poly_a, poly_b, spacing):
+    if not poly_a or not poly_b:
+        return False
+    if polygons_intersect(poly_a, poly_b):
+        return True
+    if spacing <= 0:
+        return False
+    threshold_sq = spacing * spacing
+    pa = _close_polygon(poly_a)
+    pb = _close_polygon(poly_b)
+    for i in range(len(pa) - 1):
+        for j in range(len(pb) - 1):
+            if _segments_distance_sq(pa[i], pa[i + 1], pb[j], pb[j + 1]) <= threshold_sq:
+                return True
     return False
 
 
@@ -554,6 +875,107 @@ def build_outline_polygon(part, rotation, anchor_x, anchor_y, rot_bbox=None):
     if pts[0] != pts[-1]:
         pts.append(pts[0])
     return pts
+
+
+def _compute_rotation_entry(part, angle):
+    origin = part.get("centroid", part.get("origin", (0, 0)))
+    entities = part.get("entities", [])
+    transformed = [
+        transform_entity(e, origin, angle, 0, 0) for e in entities if e is not None
+    ]
+    if transformed:
+        rot_bbox = bbox_from_entities(transformed)
+    else:
+        rot_bbox = part.get("orig_bbox") or (0.0, 0.0, 0.0, 0.0)
+    if not rot_bbox:
+        rot_bbox = (0.0, 0.0, 0.0, 0.0)
+    width = max(rot_bbox[2] - rot_bbox[0], 0.0)
+    height = max(rot_bbox[3] - rot_bbox[1], 0.0)
+
+    outline_rel = None
+    outer = part.get("outer")
+    if outer:
+        transformed_outer = transform_entity(outer, origin, angle, 0, 0)
+        outline_pts = _polygon_points_from_entity(transformed_outer, auto_close=True)
+        if outline_pts:
+            outline_rel = [
+                (px - rot_bbox[0], py - rot_bbox[1]) for px, py in outline_pts
+            ]
+
+    return {
+        "rot_bbox": rot_bbox,
+        "width": width,
+        "height": height,
+        "area": width * height,
+        "outline_relative": outline_rel,
+    }
+
+
+def ensure_rotation_cache(part, angles):
+    if not angles:
+        return
+    cache = part.setdefault("rotation_cache", {})
+    for ang in angles:
+        if ang in cache:
+            continue
+        cache[ang] = _compute_rotation_entry(part, ang)
+
+
+def outline_polygon_for_part(part, rotation, anchor_x, anchor_y):
+    cache = part.get("rotation_cache", {})
+    entry = cache.get(rotation)
+    rot_bbox = None
+    if entry:
+        outline_rel = entry.get("outline_relative")
+        if outline_rel:
+            return [(anchor_x + px, anchor_y + py) for px, py in outline_rel]
+        rot_bbox = entry.get("rot_bbox")
+    return build_outline_polygon(part, rotation, anchor_x, anchor_y, rot_bbox)
+
+
+def expand_rotation_candidates(part, step=5):
+    if part.get("_expanded_rotations"):
+        return False
+    step = max(1, int(step))
+    extra_angles = [float(a % 360) for a in range(0, 360, step)]
+    existing = part.get("rotation_candidates", [])
+    merged = sorted({float(angle % 360) for angle in (list(existing) + extra_angles)})
+    ensure_rotation_cache(part, merged)
+    part["rotation_candidates"] = merged
+    part["_expanded_rotations"] = True
+    return True
+
+
+def preferred_rotation_angles_from_outline(part, snap_step=5):
+    outline = _polygon_points_from_entity(part.get("outer"), auto_close=True)
+    if not outline or len(outline) < 2:
+        return []
+    step = max(1, int(snap_step))
+    angles = set()
+    for idx in range(1, len(outline)):
+        p1 = outline[idx - 1]
+        p2 = outline[idx]
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            continue
+        raw = (math.degrees(math.atan2(dy, dx))) % 180
+        snapped = (round(raw / step) * step) % 180
+        for offset in (0.0, 180.0):
+            angles.add((snapped + offset) % 360)
+    return sorted(angles)
+
+
+def outlines_conflict(candidate_outline, candidate_bbox, existing_part, spacing):
+    pb = existing_part.get("placed_bbox")
+    if not pb:
+        return False
+    if not boxes_intersect(candidate_bbox, pb, spacing):
+        return False
+    existing_outline = existing_part.get("outline_polygon")
+    if candidate_outline and existing_outline:
+        return polygons_overlap_with_spacing(candidate_outline, existing_outline, spacing)
+    return True
 
 
 def part_surface_area_mm2(part):
@@ -748,13 +1170,23 @@ def flatten_insert(doc, ent_insert):
 
 
 def group_entities_universal(entities, doc=None):
-    outlines = [e for e in entities if e["type"] == "LWPOLYLINE" and e.get("closed")]
+    entities = list(entities or [])
+    synthetic_loops = _synthesize_closed_polylines_from_segments(entities)
+    enriched_entities = entities + synthetic_loops
+
+    contour_nodes = _contour_nodes_from_entities(enriched_entities)
+    if contour_nodes:
+        parts = _build_parts_from_contours(contour_nodes, enriched_entities)
+        if parts:
+            return parts
+
+    outlines = [e for e in enriched_entities if e["type"] == "LWPOLYLINE" and e.get("closed")]
     if not outlines:
-        outlines = [e for e in entities if e["type"] == "LWPOLYLINE"]
+        outlines = [e for e in enriched_entities if e["type"] == "LWPOLYLINE"]
     inserts = [e for e in entities if e["type"] == "INSERT"]
     if outlines:
         parts = []
-        others = [e for e in entities if e not in outlines]
+        others = [e for e in enriched_entities if e not in outlines]
         for out in outlines:
             part = {
                 "outer": out,
@@ -787,8 +1219,8 @@ def group_entities_universal(entities, doc=None):
                         part["others"].append(h)
                 elif h["type"] == "SPLINE":
                     if poly:
-                        c = polygon_centroid(h["points"])
-                        if point_in_polygon(c, poly):
+                        c = polygon_centroid(h.get("points", [])) if h.get("points") else None
+                        if c and point_in_polygon(c, poly):
                             part["splines"].append(h)
                         else:
                             part["others"].append(h)
@@ -833,7 +1265,7 @@ def group_entities_universal(entities, doc=None):
     return [
         {
             "outer": None,
-            "holes": entities,
+            "holes": enriched_entities,
             "circles": [],
             "arcs": [],
             "splines": [],
@@ -937,7 +1369,6 @@ def build_pdf_report(
     sheets,
     cfg,
     preview_canvas_px,
-    show_bbox,
     show_outline,
     scope="Single sheet",
     sel_idx=1,
@@ -1082,7 +1513,15 @@ def build_pdf_report(
         ["Material", str(cfg.get("material", "-"))],
         ["Thickness", str(cfg.get("thickness", "-"))],
         ["Sheet Size", f"{cfg['sheet_w']} x {cfg['sheet_h']} mm"],
-        ["Kerf", str(cfg.get("kerf", cfg.get("kerf_width", 0)))],
+        [
+            "Border spacing",
+            str(
+                cfg.get(
+                    "border_spacing",
+                    cfg.get("kerf", cfg.get("kerf_width", DEFAULT_BORDER_SPACING)),
+                )
+            ),
+        ],
         ["Spacing", str(cfg.get("spacing", DEFAULT_SPACING))],
         ["Rotation Mode", str(rot_mode)],
         ["Rotation Step", str(rot_step)],
@@ -1220,7 +1659,15 @@ def build_pdf_report(
         ["Material", str(cfg.get("material", "-"))],
         ["Thickness", str(cfg.get("thickness", "-"))],
         ["Sheet Size", f"{cfg['sheet_w']} x {cfg['sheet_h']} mm"] ,
-        ["Kerf", str(cfg.get("kerf", cfg.get("kerf_width", 0)))],
+        [
+            "Border spacing",
+            str(
+                cfg.get(
+                    "border_spacing",
+                    cfg.get("kerf", cfg.get("kerf_width", DEFAULT_BORDER_SPACING)),
+                )
+            ),
+        ],
         ["Spacing", str(cfg.get("spacing", DEFAULT_SPACING))],
         ["Rotation Mode", str(rot_mode)],
         ["Rotation Step", str(rot_step)],
@@ -1396,7 +1843,6 @@ def build_pdf_report(
             cfg["sheet_w"],
             cfg["sheet_h"],
             canvas_px=preview_canvas_px,
-            draw_bbox=show_bbox,
             draw_outline=show_outline,
         )
         if img is not None:
@@ -1647,24 +2093,57 @@ def boxes_intersect(a, b, spacing: float = 0.0):
     )
 
 
-def find_best_rotation_for_position(
-    part, x, y, placed_parts, sheet_w, sheet_h, spacing, rotations
-):
-    origin = part.get("centroid", part.get("origin", (0, 0)))
-    entities = part["entities"]
+def orientation_mismatch_penalty(bbox_w, bbox_h, sheet_w, sheet_h):
+    """Return a fractional penalty when rotation fights the sheet orientation."""
+    max_dim = max(bbox_w, bbox_h, 1e-6)
+    min_dim = max(min(bbox_w, bbox_h), 1e-6)
+    elongation = (max_dim - min_dim) / max_dim
+    if elongation < 0.05:
+        return 0.0  # near-square parts are orientation-agnostic
 
+    sheet_landscape = sheet_w >= sheet_h
+    part_landscape = bbox_w >= bbox_h
+    if sheet_landscape == part_landscape:
+        return 0.0
+
+    sheet_ratio = max(sheet_w, sheet_h) / max(min(sheet_w, sheet_h), 1e-6)
+    part_ratio = max_dim / min_dim
+    ratio_gap = abs(math.log(sheet_ratio + 1e-6) - math.log(part_ratio + 1e-6))
+    base_penalty = 0.12
+    penalty = base_penalty + 0.08 * ratio_gap
+    return min(0.35, penalty)
+
+
+def find_best_rotation_for_position(
+    part,
+    x,
+    y,
+    placed_parts,
+    sheet_w,
+    sheet_h,
+    spacing,
+    border_spacing,
+    rotations,
+):
     best_rotation = None
     best_bbox = None
-    best_area = float("inf")
+    best_score = None
 
-    for ang in rotations:
-        rot_bbox = bbox_from_entities(
-            [transform_entity(e, origin, ang, 0, 0) for e in entities]
-        )
-        bbox_w = rot_bbox[2] - rot_bbox[0]
-        bbox_h = rot_bbox[3] - rot_bbox[1]
+    for idx, ang in enumerate(rotations or []):
+        ensure_rotation_cache(part, [ang])
+        rot_entry = part.get("rotation_cache", {}).get(ang)
+        if not rot_entry:
+            continue
+        rot_bbox = rot_entry.get("rot_bbox")
+        bbox_w = rot_entry.get("width", 0.0)
+        bbox_h = rot_entry.get("height", 0.0)
 
-        if x + bbox_w + spacing > sheet_w or y + bbox_h + spacing > sheet_h:
+        if (
+            x < border_spacing
+            or y < border_spacing
+            or x + bbox_w > sheet_w - border_spacing
+            or y + bbox_h > sheet_h - border_spacing
+        ):
             continue
 
         candidate = (x, y, x + bbox_w, y + bbox_h)
@@ -1675,33 +2154,39 @@ def find_best_rotation_for_position(
             pb = existing.get("placed_bbox")
             if not pb:
                 continue
-            if not boxes_intersect(candidate, pb, spacing):
+            if not boxes_intersect(candidate, pb, 0.0):
                 continue
             existing_outline = existing.get("outline_polygon")
             if existing_outline:
                 if candidate_outline is None:
-                    candidate_outline = build_outline_polygon(
-                        part,
-                        ang,
-                        x,
-                        y,
-                        rot_bbox,
-                    )
+                    candidate_outline = outline_polygon_for_part(part, ang, x, y)
                     if candidate_outline is None:
                         conflict = True
                         break
-                if polygons_intersect(candidate_outline, existing_outline):
+                if polygons_overlap_with_spacing(candidate_outline, existing_outline, spacing):
                     conflict = True
                     break
             else:
-                conflict = True
-                break
+                if boxes_intersect(candidate, pb, spacing):
+                    conflict = True
+                    break
         if conflict:
             continue
 
         area = bbox_w * bbox_h
-        if area < best_area:
-            best_area = area
+        penalty = orientation_mismatch_penalty(bbox_w, bbox_h, sheet_w, sheet_h)
+        effective_area = area * (1.0 + penalty)
+        preferred_span = bbox_w if sheet_w >= sheet_h else bbox_h
+        score = (
+            effective_area,
+            area,
+            penalty,
+            -preferred_span,
+            idx,
+        )
+
+        if best_score is None or score < best_score:
+            best_score = score
             best_rotation = ang
             best_bbox = (candidate, (x, y), rot_bbox)
 
@@ -1709,7 +2194,14 @@ def find_best_rotation_for_position(
 
 
 def bottom_left_place_with_rotation(
-    part, placed_parts, sheet_w, sheet_h, spacing, rotations, aggressive=False
+    part,
+    placed_parts,
+    sheet_w,
+    sheet_h,
+    spacing,
+    border_spacing,
+    rotations,
+    aggressive=False,
 ):
     """
     Try to place `part` on the sheet using a bottom‑left heuristic.
@@ -1719,18 +2211,23 @@ def bottom_left_place_with_rotation(
     - We do NOT cap the number of candidate positions; this lets us exploit
       narrow leftover strips and corners.
     """
-    potential_xs = {spacing}
-    potential_ys = {spacing}
+    potential_xs = {border_spacing}
+    potential_ys = {border_spacing}
 
     existing_bboxes = [p["placed_bbox"] for p in placed_parts if p.get("placed_bbox")]
-    current_max_x = max((bb[2] for bb in existing_bboxes), default=spacing)
-    current_max_y = max((bb[3] for bb in existing_bboxes), default=spacing)
-    base_extent_x = max(current_max_x, spacing)
-    base_extent_y = max(current_max_y, spacing)
+    current_max_x = max((bb[2] for bb in existing_bboxes), default=border_spacing)
+    current_max_y = max((bb[3] for bb in existing_bboxes), default=border_spacing)
+    base_extent_x = max(current_max_x, border_spacing)
+    base_extent_y = max(current_max_y, border_spacing)
     base_extent_area = base_extent_x * base_extent_y
 
     for existing in placed_parts:
-        pb = existing.get("placed_bbox") or (spacing, spacing, spacing, spacing)
+        pb = existing.get("placed_bbox") or (
+            border_spacing,
+            border_spacing,
+            border_spacing,
+            border_spacing,
+        )
         # Right / top edges
         potential_xs.add(pb[2] + spacing)
         potential_ys.add(pb[3] + spacing)
@@ -1748,7 +2245,15 @@ def bottom_left_place_with_rotation(
     for y in sorted_ys:
         for x in sorted_xs:
             rotation, bbox_info = find_best_rotation_for_position(
-                part, x, y, placed_parts, sheet_w, sheet_h, spacing, rotations
+                part,
+                x,
+                y,
+                placed_parts,
+                sheet_w,
+                sheet_h,
+                spacing,
+                border_spacing,
+                rotations,
             )
             if rotation is None or bbox_info is None:
                 continue
@@ -1780,12 +2285,12 @@ def nest_parts_improved(
     sheet_w,
     sheet_h,
     spacing,
-    kerf,
+    border_spacing,
     rotations,
     free_rotation=False,
     advanced_sort=True,
     enable_compaction=True,
-    rotation_prune_tolerance=0.0,
+    rotation_prune_tolerance=0.05,
     aggressive_packing=True,
 ):
     """
@@ -1800,6 +2305,19 @@ def nest_parts_improved(
     IMPORTANT: upload order is ignored. Parts are shuffled and then ordered
     by geometry, not by file sequence.
     """
+
+    spacing = max(0.0, float(spacing))
+    border_spacing = max(0.0, float(border_spacing))
+
+    MIN_UTILIZATION_BEFORE_NEW_SHEET = 0.83 # target 82%+ fill before opening another sheet
+    MAX_DEFER_ATTEMPTS = 2
+    sheet_area = sheet_w * sheet_h if sheet_w > 0 and sheet_h > 0 else 0.0
+
+    def _sheet_utilization(sheet):
+        if sheet_area <= 0.0:
+            return 1.0
+        area_sum = sum(part_surface_area_mm2(p) for p in sheet)
+        return area_sum / sheet_area if sheet_area else 1.0
 
     # ---- PREPARE PART GEOMETRY ------------------------------------------------
     # Randomize initial order so we don't depend on upload order
@@ -1820,6 +2338,7 @@ def nest_parts_improved(
         part["orig_bbox"] = bbox_from_entities(ents)
         part["centroid"] = get_part_centroid(part)
         calculate_relative_offsets_for_part(part)
+        part["rotation_cache"] = {}
 
     # ---- ORDERING: LARGE / SHEET‑LIKE FIRST ----------------------------------
     if advanced_sort:
@@ -1851,29 +2370,37 @@ def nest_parts_improved(
     else:
         rotation_angles = rotations
 
+    if not rotation_angles:
+        rotation_angles = [0.0]
+    rotation_angles = sorted({float(angle % 360) for angle in rotation_angles})
+    base_rotation_angles = rotation_angles
+
+    for p in parts:
+        feature_angles = preferred_rotation_angles_from_outline(p)
+        part_angles = sorted({*base_rotation_angles, *feature_angles}) or base_rotation_angles
+        ensure_rotation_cache(p, part_angles)
+        p["_base_rotation_angles"] = part_angles
+
     # Optional pruning: keep only angles whose bbox area is close to best
     if rotation_prune_tolerance > 0:
+        tol_factor = 1 + rotation_prune_tolerance
         for p in parts:
-            origin = p.get("centroid", p.get("origin", (0, 0)))
-            candidates = []
-            min_area = float("inf")
-            for ang in rotation_angles:
-                rot_bbox = bbox_from_entities(
-                    [transform_entity(e, origin, ang, 0, 0) for e in p["entities"]]
-                )
-                area = calculate_bbox_area(rot_bbox)
-                candidates.append((ang, rot_bbox, area))
-                if area < min_area:
-                    min_area = area
+            cache = p.get("rotation_cache", {})
+            part_angles = p.get("_base_rotation_angles", base_rotation_angles)
+            areas = [cache[ang]["area"] for ang in part_angles if ang in cache]
+            if not areas:
+                p["rotation_candidates"] = part_angles
+                continue
+            min_area = min(areas)
             allowed = [
                 ang
-                for ang, _rb, area in candidates
-                if area <= min_area * (1 + rotation_prune_tolerance)
-            ] or rotation_angles
+                for ang in part_angles
+                if cache.get(ang, {}).get("area", float("inf")) <= min_area * tol_factor
+            ] or part_angles
             p["rotation_candidates"] = allowed
     else:
         for p in parts:
-            p["rotation_candidates"] = rotation_angles
+            p["rotation_candidates"] = list(p.get("_base_rotation_angles", base_rotation_angles))
 
     # ---- INITIAL BOTTOM‑LEFT NESTING -----------------------------------------
     sheets: list[list[dict]] = []
@@ -1881,65 +2408,95 @@ def nest_parts_improved(
     while parts:
         part = parts.pop(0)
         placed = False
+        deferred = False
 
-        # Try existing sheets first
-        for sheet in sheets:
-            rotation_list = part.get("rotation_candidates", rotation_angles)
-            placement = bottom_left_place_with_rotation(
-                part,
-            sheet,
-                sheet_w,
-                sheet_h,
-                spacing,
-                rotation_list,
-                aggressive=aggressive_packing,
+        while True:
+            rotation_list = part.get("rotation_candidates") or part.get(
+                "_base_rotation_angles", rotation_angles
             )
-            if placement:
-                rotation, candidate, anchor, rot_bbox = placement
-                outline_polygon = build_outline_polygon(
+            if not rotation_list:
+                rotation_list = [0.0]
+
+            # Try existing sheets first
+            for sheet in sheets:
+                placement = bottom_left_place_with_rotation(
                     part,
-                    rotation,
-                    anchor[0],
-                    anchor[1],
-                    rot_bbox,
+                    sheet,
+                    sheet_w,
+                    sheet_h,
+                    spacing,
+                    border_spacing,
+                    rotation_list,
+                    aggressive=aggressive_packing,
                 )
-                inst = part.copy()
-                inst.update(
-                    {
-                        "placed_bbox": candidate,
-                        "rotation": rotation,
-                        "anchor_X": anchor[0],
-                        "anchor_Y": anchor[1],
-                        "rotation_origin": part["centroid"],
-                        "rotated_min": (rot_bbox[0], rot_bbox[1]),
-                        "outline_polygon": outline_polygon,
-                    }
-                )
-                sheet.append(inst)
-                placed = True
+                if placement:
+                    rotation, candidate, anchor, rot_bbox = placement
+                    outline_polygon = outline_polygon_for_part(
+                        part,
+                        rotation,
+                        anchor[0],
+                        anchor[1],
+                    )
+                    part.pop("_deferred_attempts", None)
+                    inst = part.copy()
+                    inst.update(
+                        {
+                            "placed_bbox": candidate,
+                            "rotation": rotation,
+                            "anchor_X": anchor[0],
+                            "anchor_Y": anchor[1],
+                            "rotation_origin": part["centroid"],
+                            "rotated_min": (rot_bbox[0], rot_bbox[1]),
+                            "outline_polygon": outline_polygon,
+                        }
+                    )
+                    sheet.append(inst)
+                    placed = True
+                    break
+
+            if placed:
                 break
 
-        # If not placed, open a new sheet
-        if not placed:
-            rotation_list = part.get("rotation_candidates", rotation_angles)
+            allow_new_sheet = True
+            if sheets and sheet_area > 0.0:
+                last_util = _sheet_utilization(sheets[-1]) if sheets[-1] else 0.0
+                if (
+                    last_util < MIN_UTILIZATION_BEFORE_NEW_SHEET
+                    and len(parts) > 0
+                ):
+                    allow_new_sheet = False
+                    defer_count = part.get("_deferred_attempts", 0)
+                    if defer_count < MAX_DEFER_ATTEMPTS:
+                        part["_deferred_attempts"] = defer_count + 1
+                        parts.append(part)
+                        deferred = True
+                        break
+                    else:
+                        allow_new_sheet = True
+
+            # If not placed, try a fresh sheet
+            if not allow_new_sheet and not deferred:
+                continue
+
             placement = bottom_left_place_with_rotation(
                 part,
                 [],
                 sheet_w,
                 sheet_h,
                 spacing,
+                border_spacing,
                 rotation_list,
                 aggressive=aggressive_packing,
             )
             if placement:
                 rotation, candidate, anchor, rot_bbox = placement
-                outline_polygon = build_outline_polygon(
+                outline_polygon = outline_polygon_for_part(
                     part,
                     rotation,
                     anchor[0],
                     anchor[1],
-                    rot_bbox,
                 )
+                part.pop("_deferred_attempts", None)
                 inst = part.copy()
                 inst.update(
                     {
@@ -1953,10 +2510,16 @@ def nest_parts_improved(
                     }
                 )
                 sheets.append([inst])
-            else:
-                # Part cannot fit even on an empty sheet with spacing
+                placed = True
+                break
+
+            # Attempt to expand rotation candidates for tighter fit
+            if not expand_rotation_candidates(part):
                 debug(f"Part {part.get('label', '')} does not fit on sheet.")
-                # We keep going; this part simply isn't nestable.
+                break
+
+        if deferred:
+            continue
 
     # ---- COMPACTION: SLIDE LEFT/UP -------------------------------------------
     if enable_compaction:
@@ -1971,35 +2534,45 @@ def nest_parts_improved(
                     others = [p["placed_bbox"] for p in sheet if p is not part]
 
                     # Left limit
-                    left_limit = spacing
+                    left_limit = border_spacing
                     for ob in others:
                         if (
                             ob[2] <= bbox[0]
                             and not (ob[3] <= bbox[1] or ob[1] >= bbox[3])
                         ):
                             left_limit = max(left_limit, ob[2] + spacing)
-                    new_x = max(left_limit, spacing)
+                    new_x = max(left_limit, border_spacing)
 
                     # Top limit (CAD coords)
-                    top_limit = spacing
+                    top_limit = border_spacing
                     for ob in others:
                         if (
                             ob[3] <= bbox[1]
                             and not (ob[2] <= bbox[0] or ob[0] >= bbox[2])
                         ):
                             top_limit = max(top_limit, ob[3] + spacing)
-                    new_y = max(top_limit, spacing)
+                    new_y = max(top_limit, border_spacing)
 
                     if new_x < bbox[0] or new_y < bbox[1]:
-                        part["placed_bbox"] = (new_x, new_y, new_x + w, new_y + h)
-                        part["anchor_X"] = new_x
-                        part["anchor_Y"] = new_y
-                        part["outline_polygon"] = build_outline_polygon(
+                        cand_bbox = (new_x, new_y, new_x + w, new_y + h)
+                        cand_outline = outline_polygon_for_part(
                             part,
                             part.get("rotation", 0),
                             new_x,
                             new_y,
                         )
+                        if cand_outline is None:
+                            continue
+                        if any(
+                            outlines_conflict(cand_outline, cand_bbox, other, spacing)
+                            for other in sheet
+                            if other is not part
+                        ):
+                            continue
+                        part["placed_bbox"] = cand_bbox
+                        part["anchor_X"] = new_x
+                        part["anchor_Y"] = new_y
+                        part["outline_polygon"] = cand_outline
 
             # Fine sliding in small steps
             step = max(1.0, spacing)
@@ -2010,47 +2583,70 @@ def nest_parts_improved(
                     bx = part["placed_bbox"]
                     w = bx[2] - bx[0]
                     h = bx[3] - bx[1]
-                    others = [p["placed_bbox"] for p in sheet if p is not part]
+                    others = [p for p in sheet if p is not part]
+                    rotation = part.get("rotation", 0)
 
-                    # Slide horizontally
+                    # Slide horizontally using outline-aware checks
                     target_x = bx[0]
-                    while target_x - step >= spacing:
-                        cand = (target_x - step, bx[1], target_x - step + w, bx[3])
-                        if all(
-                            not boxes_intersect(cand, o, spacing)
-                            for o in others
+                    while target_x - step >= border_spacing:
+                        cand_x = target_x - step
+                        cand_bbox = (cand_x, bx[1], cand_x + w, bx[3])
+                        cand_outline = outline_polygon_for_part(
+                            part,
+                            rotation,
+                            cand_x,
+                            bx[1],
+                        )
+                        if any(
+                            outlines_conflict(cand_outline, cand_bbox, other, spacing)
+                            for other in others
                         ):
-                            target_x -= step
-                        else:
                             break
+                        target_x = cand_x
 
-                    # Slide vertically
+                    # Slide vertically using outline-aware checks
                     target_y = bx[1]
-                    while target_y - step >= spacing:
-                        cand = (bx[0], target_y - step, bx[2], target_y - step + h)
-                        if all(
-                            not boxes_intersect(cand, o, spacing)
-                            for o in others
+                    while target_y - step >= border_spacing:
+                        cand_y = target_y - step
+                        cand_bbox = (target_x, cand_y, target_x + w, cand_y + h)
+                        cand_outline = outline_polygon_for_part(
+                            part,
+                            rotation,
+                            target_x,
+                            cand_y,
+                        )
+                        if any(
+                            outlines_conflict(cand_outline, cand_bbox, other, spacing)
+                            for other in others
                         ):
-                            target_y -= step
-                        else:
                             break
+                        target_y = cand_y
 
                     if target_x < bx[0] or target_y < bx[1]:
-                        part["placed_bbox"] = (
+                        cand_bbox = (
                             target_x,
                             target_y,
                             target_x + w,
                             target_y + h,
                         )
-                        part["anchor_X"] = target_x
-                        part["anchor_Y"] = target_y
-                        part["outline_polygon"] = build_outline_polygon(
+                        cand_outline = outline_polygon_for_part(
                             part,
                             part.get("rotation", 0),
                             target_x,
                             target_y,
                         )
+                        if cand_outline is None:
+                            continue
+                        if any(
+                            outlines_conflict(cand_outline, cand_bbox, other, spacing)
+                            for other in sheet
+                            if other is not part
+                        ):
+                            continue
+                        part["placed_bbox"] = cand_bbox
+                        part["anchor_X"] = target_x
+                        part["anchor_Y"] = target_y
+                        part["outline_polygon"] = cand_outline
                         moved = True
 
         for sh in sheets:
@@ -2066,25 +2662,30 @@ def nest_parts_improved(
             for part in current:
                 relocated = False
                 for earlier in sheets[:s_idx]:
-                    rotation_list = part.get("rotation_candidates", rotation_angles)
+                    rotation_list = part.get("rotation_candidates") or part.get(
+                        "_base_rotation_angles", rotation_angles
+                    )
+                    if not rotation_list:
+                        rotation_list = [0.0]
                     placement = bottom_left_place_with_rotation(
                         part,
                         earlier,
                         sheet_w,
                         sheet_h,
                         spacing,
+                        border_spacing,
                         rotation_list,
                         aggressive=True,
                     )
                     if placement:
                         rotation, candidate, anchor, rot_bbox = placement
-                        outline_polygon = build_outline_polygon(
+                        outline_polygon = outline_polygon_for_part(
                             part,
                             rotation,
                             anchor[0],
                             anchor[1],
-                            rot_bbox,
                         )
+                        part.pop("_deferred_attempts", None)
                         inst = part.copy()
                         inst.update(
                             {
@@ -2123,16 +2724,14 @@ def nest_parts_improved(
             we return None so the caller can keep the original layout.
             """
             def part_bbox_at_rotation(part, ang):
-                origin = part.get("centroid", part.get("origin", (0, 0)))
-                rot_bbox = bbox_from_entities(
-                    [
-                        transform_entity(e, origin, ang, 0, 0)
-                        for e in part.get("entities", [])
-                    ]
-                )
-                w = rot_bbox[2] - rot_bbox[0]
-                h = rot_bbox[3] - rot_bbox[1]
-                return rot_bbox, w, h
+                ensure_rotation_cache(part, [ang])
+                entry = part.get("rotation_cache", {}).get(ang)
+                if not entry:
+                    rot_bbox = part.get("orig_bbox") or (0.0, 0.0, 0.0, 0.0)
+                    w = rot_bbox[2] - rot_bbox[0]
+                    h = rot_bbox[3] - rot_bbox[1]
+                    return rot_bbox, w, h
+                return entry["rot_bbox"], entry.get("width", 0.0), entry.get("height", 0.0)
 
             parts_local = [p.copy() for p in all_parts]
             for p in parts_local:
@@ -2264,7 +2863,11 @@ def nest_parts_improved(
             unplaced = []
 
             for part in parts_local:
-                rot_list = part.get("rotation_candidates", rotations)
+                rot_list = part.get("rotation_candidates") or part.get(
+                    "_base_rotation_angles", rotation_angles
+                )
+                if not rot_list:
+                    rot_list = [0.0]
                 best = None
 
                 # Try to place into existing sheets
@@ -2321,12 +2924,11 @@ def nest_parts_improved(
                         anchor_x + pw,
                         anchor_y + ph,
                     )
-                    outline_polygon = build_outline_polygon(
+                    outline_polygon = outline_polygon_for_part(
                         part,
                         chosen_ang,
                         anchor_x,
                         anchor_y,
-                        rot_bbox,
                     )
                     inst = part.copy()
                     inst.update(
@@ -2377,12 +2979,11 @@ def nest_parts_improved(
                         anchor_x + pw,
                         anchor_y + ph,
                     )
-                    outline_polygon = build_outline_polygon(
+                    outline_polygon = outline_polygon_for_part(
                         part,
                         ang,
                         anchor_x,
                         anchor_y,
-                        rot_bbox,
                     )
                     inst = part.copy()
                     inst.update(
@@ -2466,34 +3067,11 @@ def _add_sheet_to_modelspace(
             if o and o["type"] == "LWPOLYLINE":
                 msp.add_lwpolyline(o["points"], close=o.get("closed", False))
 
-        for (ent, offset) in part.get("relative_offsets", []):
-            rot_off = rotate_point_around((0, 0), offset, ang)
-            tx2 = tx + rot_off[0]
-            ty2 = ty + rot_off[1]
-            ent2 = transform_entity(ent, origin, ang, tx2, ty2)
-            if not ent2:
-                continue
-            if ent2["type"] == "LWPOLYLINE":
-                msp.add_lwpolyline(
-                    ent2["points"], close=ent2.get("closed", False)
-                )
-            elif ent2["type"] == "CIRCLE":
-                msp.add_circle(ent2["center"], ent2["radius"])
-            elif ent2["type"] == "ARC":
-                msp.add_arc(
-                    ent2["center"],
-                    ent2["radius"],
-                    ent2["start_angle"],
-                    ent2["end_angle"],
-                )
-            elif ent2["type"] == "SPLINE":
-                msp.add_lwpolyline(ent2["points"], close=False)
-
+        seen_ids = {id(part.get("outer"))}
         for ent in part.get("entities", []):
-            if ent in [part.get("outer")] + [
-                e for e, _ in part.get("relative_offsets", [])
-            ]:
+            if ent is None or id(ent) in seen_ids:
                 continue
+            seen_ids.add(id(ent))
             t = ent["type"]
             e2 = transform_entity(ent, origin, ang, tx, ty)
             if not e2:
@@ -2694,7 +3272,6 @@ def create_sheet_preview_image(
     sheet_h,
     canvas_px=900,
     margin=20,
-    draw_bbox=True,
     draw_outline=True,
 ):
     if sheet_w <= 0 or sheet_h <= 0:
@@ -2726,20 +3303,7 @@ def create_sheet_preview_image(
         width=2,
         fill=(255, 255, 255),
     )
-    # Pastel color palette (light tones); extend with random variation for more sheets
-    base_palette = [
-        (197, 225, 165),  # soft green
-        (187, 212, 237),  # soft blue
-        (232, 205, 192),  # soft clay
-        (203, 191, 235),  # soft violet
-        (180, 224, 223),  # soft teal
-        (246, 222, 180),  # soft apricot
-    ]
-    # Slightly shuffle palette for visual variety between renders
-    palette = base_palette[:]
-    random.shuffle(palette)
-
-    for idx, part in enumerate(sheet):
+    for part in sheet:
         bbox = part.get("placed_bbox", (0, 0, 0, 0))
         x1, y1, x2, y2 = bbox
         # Invert Y so higher CAD Y appears lower on screen (downward flip)
@@ -2747,16 +3311,6 @@ def create_sheet_preview_image(
         py1 = margin_top + int((sheet_h - y2) * sy)
         px2 = margin_side + int(x2 * sx)
         py2 = margin_top + int((sheet_h - y1) * sy)
-
-        if draw_bbox:
-            color = palette[idx % len(palette)]
-            draw.rectangle(
-                [px1, py1, px2, py2],
-                outline=(255, 255, 255),
-                width=2,
-                fill=color,
-            )
-        # Removed part name labeling per user request
 
         outer = part.get("outer")
         if outer and isinstance(outer, dict):
@@ -2775,7 +3329,7 @@ def create_sheet_preview_image(
                     pts_px.append((px, py))
                 if draw_outline and len(pts_px) >= 2:
                     draw.line(
-                        pts_px + [pts_px[0]], fill=(80, 110, 140), width=1
+                        pts_px + [pts_px[0]], fill=(80, 110, 140), width=2
                     )
 
         if draw_outline:
@@ -2930,11 +3484,10 @@ if "config_inputs" not in st.session_state:
         "sheet_w": DEFAULT_SHEET_W,
         "sheet_h": DEFAULT_SHEET_H,
         "spacing": DEFAULT_SPACING,
-        "kerf": DEFAULT_KERF,
+        "border_spacing": DEFAULT_BORDER_SPACING,
         "rotation_mode": "Free Rotation (Optimized)",
         "rotation_step": DEFAULT_ROT_STEP,
         "preview_canvas_px": 900,
-        "show_bbox": True,
         "show_outline": True,
         "advanced_sort": True,
         "enable_compaction": True,
@@ -3268,7 +3821,7 @@ with col_c:
                         st.image(thumb, use_container_width=False, clamp=True)
                     with sub[1]:
                         new_label = st.text_input(
-                            "",
+                            "Part label",
                             value=m.get("label", m["name"]),
                             key=f"tbl_label_{m['id']}",
                             label_visibility="collapsed",
@@ -3348,6 +3901,9 @@ with col_c:
 
     elif stage == "NEST":
         cfg_inputs = st.session_state.config_inputs
+        if "border_spacing" not in cfg_inputs:
+            legacy_kerf = cfg_inputs.pop("kerf", DEFAULT_BORDER_SPACING)
+            cfg_inputs["border_spacing"] = legacy_kerf
         st.markdown(
             "<div class='panel'><strong>Nesting configuration</strong></div>",
             unsafe_allow_html=True,
@@ -3374,11 +3930,6 @@ with col_c:
                     int(cfg_inputs.get("preview_canvas_px", 900)),
                     step=20,
                     key="preview_px",
-                )
-                cfg_inputs["show_bbox"] = st.toggle(
-                    "Show Bounding Boxes",
-                    value=bool(cfg_inputs.get("show_bbox", True)),
-                    key="show_bbox_toggle",
                 )
                 cfg_inputs["show_outline"] = st.toggle(
                     "Show Part Outlines",
@@ -3412,12 +3963,12 @@ with col_c:
                     step=0.5,
                     key="spacing_input",
                 )
-                cfg_inputs["kerf"] = st.number_input(
-                    "Kerf (mm)",
-                    value=float(cfg_inputs.get("kerf", DEFAULT_KERF)),
+                cfg_inputs["border_spacing"] = st.number_input(
+                    "Border spacing (mm)",
+                    value=float(cfg_inputs.get("border_spacing", DEFAULT_BORDER_SPACING)),
                     min_value=0.0,
                     step=0.1,
-                    key="kerf_input",
+                    key="border_spacing_input",
                 )
 
                 rotation_mode_options = [
@@ -3480,7 +4031,7 @@ with col_c:
                 sheet_w = float(cfg_inputs["sheet_w"])
                 sheet_h = float(cfg_inputs["sheet_h"])
                 spacing = float(cfg_inputs["spacing"])
-                kerf = float(cfg_inputs["kerf"])
+                border_spacing = float(cfg_inputs["border_spacing"])
                 rotation_mode = cfg_inputs["rotation_mode"]
                 rotation_step = int(cfg_inputs.get("rotation_step", DEFAULT_ROT_STEP))
 
@@ -3515,7 +4066,7 @@ with col_c:
                                 sheet_w,
                                 sheet_h,
                                 spacing,
-                                kerf,
+                                border_spacing,
                                 rotations,
                                 free_rotation=free_rotation,
                                 advanced_sort=bool(cfg_inputs.get("advanced_sort", True)),
@@ -3540,7 +4091,7 @@ with col_c:
                                 "sheet_w": sheet_w,
                                 "sheet_h": sheet_h,
                                 "spacing": spacing,
-                                "kerf": kerf,
+                                "border_spacing": border_spacing,
                                 "rotation_mode": rotation_mode,
                             }
                             _auto_save_project()  # automatic save after successful nesting
@@ -3588,12 +4139,13 @@ with col_c:
                 "sheet_w": float(cfg_inputs.get("sheet_w", DEFAULT_SHEET_W)),
                 "sheet_h": float(cfg_inputs.get("sheet_h", DEFAULT_SHEET_H)),
                 "spacing": float(cfg_inputs.get("spacing", DEFAULT_SPACING)),
-                "kerf": float(cfg_inputs.get("kerf", DEFAULT_KERF)),
+                "border_spacing": float(
+                    cfg_inputs.get("border_spacing", DEFAULT_BORDER_SPACING)
+                ),
             }
             project_stub = _current_project_file_stub()
 
             preview_canvas_px = int(cfg_inputs.get("preview_canvas_px", 900))
-            show_bbox = bool(cfg_inputs.get("show_bbox", True))
             show_outline = bool(cfg_inputs.get("show_outline", True))
 
             m1, m2, m3, m4 = st.columns(4)
@@ -3684,7 +4236,6 @@ with col_c:
                 cfg["sheet_w"],
                 cfg["sheet_h"],
                 canvas_px=preview_canvas_px,
-                draw_bbox=show_bbox,
                 draw_outline=show_outline,
             )
             if preview:
@@ -4001,7 +4552,6 @@ with col_c:
                                 sheets,
                                 cfg,
                                 preview_canvas_px,
-                                show_bbox,
                                 show_outline,
                                 scope=export_scope,
                                 sel_idx=sel_idx,
@@ -4036,7 +4586,6 @@ with col_c:
                                     cfg["sheet_w"],
                                     cfg["sheet_h"],
                                     canvas_px=preview_canvas_px,
-                                    draw_bbox=show_bbox,
                                     draw_outline=show_outline,
                                 )
                                 if img is None:
@@ -4071,7 +4620,6 @@ with col_c:
                                 cfg["sheet_w"],
                                 cfg["sheet_h"],
                                 canvas_px=preview_canvas_px,
-                                draw_bbox=show_bbox,
                                 draw_outline=show_outline,
                             )
                             if img is None:
